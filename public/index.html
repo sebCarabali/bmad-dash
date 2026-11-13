@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BMAD Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ctext x='16' y='22' font-size='18' font-family='Arial' font-weight='700' fill='white' text-anchor='middle'%3EB%3C/text%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ============ Pantalla de inicio ============ -->
+  <section id="start" class="start hidden">
+    <div class="start-col">
+      <div class="start-card">
+        <div class="brand">
+          <div class="logo">B</div>
+          <div>
+            <h1>BMAD Dashboard</h1>
+            <p class="muted">Visualiza épicas, historias y los próximos comandos de tu proyecto BMAD Method.</p>
+          </div>
+        </div>
+
+        <div class="pick">
+          <button class="btn primary big" id="pick-btn">📁 Seleccionar carpeta del proyecto</button>
+          <input type="file" id="dir-input" webkitdirectory directory multiple class="hidden" />
+          <p class="muted small-text" id="pick-help">Elige la raíz del proyecto (la que contiene <code>_bmad</code>, <code>_bmad-output</code> o <code>.bmad-core</code>).
+            Los archivos se leen en tu navegador; solo se envían los archivos BMAD (historias, épicas, sprint-status) para analizarlos.</p>
+          <div id="pick-hint" class="hint"></div>
+        </div>
+
+        <form id="open-form" class="open-form hidden">
+          <div class="divider"><span>o por ruta (modo local)</span></div>
+          <label for="path-input">Ruta del proyecto en este equipo</label>
+          <div class="row">
+            <input id="path-input" type="text" spellcheck="false" autocomplete="off" placeholder="C:\proyectos\mi-app  ó  /home/usuario/mi-app" />
+            <button type="button" class="btn ghost" id="browse-btn">Explorar…</button>
+            <button type="submit" class="btn">Abrir</button>
+          </div>
+          <div id="detect-hint" class="hint"></div>
+          <div id="browser" class="browser hidden">
+            <div class="browser-head">
+              <button type="button" class="btn small ghost" id="browser-up" title="Subir">↑</button>
+              <span id="browser-path" class="mono"></span>
+              <span class="spacer"></span>
+              <select id="browser-roots" class="small"></select>
+              <button type="button" class="btn small primary" id="browser-select">Usar esta carpeta</button>
+            </div>
+            <ul id="browser-list" class="browser-list"></ul>
+          </div>
+        </form>
+
+        <div id="recents" class="recents"></div>
+      </div>
+
+      <div class="start-card" id="account-card">
+        <div id="account"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ Dashboard ============ -->
+  <section id="app" class="app hidden">
+    <header class="topbar">
+      <div class="brand small">
+        <div class="logo">B</div>
+        <div>
+          <div class="project-name" id="project-name"></div>
+          <div class="project-path mono" id="project-path"></div>
+        </div>
+      </div>
+      <span class="spacer"></span>
+      <span id="sync-state" class="sync-state"></span>
+      <label class="field-inline">Comandos
+        <select id="style-select">
+          <option value="v6-slash">v6 · /bmad:bmm:workflows:*</option>
+          <option value="v6-agent">v6 · agente + *menú</option>
+          <option value="v6-dash">v6 · /bmad-bmm-*</option>
+          <option value="v4">v4 · @agente *comando</option>
+        </select>
+      </label>
+      <label class="toggle" id="auto-wrap" title="Recargar cada 15 segundos">
+        <input type="checkbox" id="auto-refresh" /> Auto
+      </label>
+      <button class="btn ghost" id="refresh-btn" title="Volver a leer la carpeta">⟳ Recargar</button>
+      <button class="btn ghost" id="change-btn">Cambiar proyecto</button>
+    </header>
+
+    <div id="readonly-banner" class="banner hidden"></div>
+
+    <nav class="tabs" id="tabs">
+      <a href="#resumen" data-tab="resumen">Resumen</a>
+      <a href="#tablero" data-tab="tablero">Tablero</a>
+      <a href="#epicas" data-tab="epicas">Épicas</a>
+      <a href="#comandos" data-tab="comandos">Próximos pasos</a>
+      <a href="#nueva" data-tab="nueva">Nueva historia</a>
+      <a href="#alertas" data-tab="alertas">Alertas <span class="badge" id="alert-count"></span></a>
+    </nav>
+
+    <main id="view" class="view"></main>
+    <footer class="foot muted" id="foot"></footer>
+  </section>
+
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-box">
+      <button class="modal-close" id="modal-close" aria-label="Cerrar">×</button>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="vendor/supabase.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

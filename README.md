@@ -1,0 +1,74 @@
+# BMAD Dashboard
+
+Dashboard (NestJS) que convierte el estado de tu proyecto **BMAD Method** en información visual:
+épicas, historias, progreso de tareas, alertas de consistencia, **comandos sugeridos** para continuar,
+un **generador de especificaciones** de historias y el **historial del sprint** guardado en Supabase.
+
+## Cómo funciona
+
+| Modo | Cuándo | Qué hace |
+|---|---|---|
+| **Carpeta del navegador** | Web publicada (Vercel) y local | Eliges la carpeta del proyecto. El navegador la lee (File System Access API) y envía **solo** los archivos BMAD (historias, épicas, `sprint-status.yaml`, config) a la API para analizarlos. En Chrome/Edge las historias nuevas se escriben directamente en tu carpeta. En Firefox/Safari se usa un selector de solo lectura y las historias se descargan. |
+| **Ruta local** | Solo al ejecutar la app en tu equipo | Escribes o exploras la ruta; el servidor lee el disco. Deshabilitado en Vercel. |
+| **Nube (Supabase)** | Con sesión iniciada | Cada vez que cambia el estado se guarda un snapshot: tendencia del sprint, último estado visible desde cualquier dispositivo (solo lectura) y especificaciones guardadas. |
+
+## Vistas
+
+- **Resumen**: KPIs, distribución por estado, tendencia del sprint, foco actual, progreso por épica, siguiente paso, actividad y artefactos.
+- **Tablero**: kanban `backlog → drafted → ready-for-dev → in-progress → review → done` con filtros.
+- **Épicas**: progreso, estado declarado vs. real, retrospectiva.
+- **Próximos pasos**: comandos priorizados (code-review, dev-story, story-context, create-story, retrospective…) con botón de copiar.
+  Formato elegible: `/bmad:bmm:workflows:*`, agente + `*menú`, `/bmad-bmm-*` o v4 (`@dev *develop-story`).
+- **Nueva historia**: formulario → markdown con la plantilla BMAD (v6/v4), checklist de calidad, guardado en la carpeta y registro en `sprint-status.yaml`.
+- **Alertas**: estados desincronizados, historias `done` con tareas abiertas, historias sin archivo, épicas por cerrar.
+
+## Desarrollo local
+
+```bash
+cp .env.example .env      # opcional: Supabase
+npm install
+npm run build && npm run start:prod    # http://localhost:3737
+```
+
+Variables: `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `PORT` (3737), `HOST` (127.0.0.1), `LOCAL_FS` (true fuera de Vercel), `BMAD_DEFAULT_DIR`.
+
+## Despliegue en Vercel
+
+`vercel.json` compila Nest (`npm run build`), sirve `public/` como estático y enruta `/api/*` a `api/index.js`,
+que reutiliza la app Nest compilada (`dist/serverless.js`). Configura `SUPABASE_URL` y `SUPABASE_PUBLISHABLE_KEY` en el proyecto.
+
+En Supabase → Authentication → URL Configuration, pon la URL de Vercel como **Site URL** y añádela a **Redirect URLs**
+para que el enlace de acceso por email vuelva a la app.
+
+## Base de datos (Supabase)
+
+| Tabla | Contenido |
+|---|---|
+| `projects` | Un registro por usuario y carpeta (`owner_id`, `root_label`, nombre, versión BMAD) |
+| `snapshots` | Estado completo del dashboard (`jsonb`) + contadores para la tendencia; solo se inserta si el estado cambió |
+| `story_specs` | Especificaciones generadas (markdown, checklist, si se guardó en disco) |
+
+Todas con **RLS**: cada usuario solo lee y escribe sus filas. La API usa la clave publishable con el JWT del usuario.
+
+## API
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| GET | `/api/config` | Modo, configuración pública de Supabase y reglas de escaneo |
+| POST | `/api/analyze` | Analiza los archivos enviados por el navegador → dashboard |
+| POST | `/api/spec/build` | Genera la historia (y el `sprint-status.yaml` actualizado) |
+| GET/POST/DELETE | `/api/projects`, `/api/projects/sync`, `/api/projects/:id/{history,latest,specs}` | Nube (requiere `Authorization: Bearer <jwt>`) |
+| GET/POST | `/api/local/{detect,dashboard,story,fs,spec/save}` | Solo modo local |
+
+## Estructura
+
+```
+api/index.js                 # función de Vercel → dist/serverless.js
+src/
+  main.ts / serverless.ts    # arranque local / Vercel
+  bmad/core/                 # análisis puro: parsers, analizador, sugerencias, generador de historias
+  bmad/analyze.controller.ts # /api/analyze, /api/spec/build
+  bmad/local/                # modo local (lee el disco)
+  projects/                  # proyectos, snapshots y specs en Supabase
+public/                      # frontend sin build (HTML + CSS + JS)
+```
