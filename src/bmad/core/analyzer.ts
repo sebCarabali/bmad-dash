@@ -33,7 +33,8 @@ export const IGNORED_DIRS = [
 ];
 /** Instalación del método (plantillas, agentes): solo se lee su config. */
 export const METHOD_DIRS = ['_bmad', '.bmad-core', '.bmad'];
-export const CONFIG_FILES = ['_bmad/bmm/config.yaml', 'bmad/bmm/config.yaml', '.bmad-core/core-config.yaml'];
+/** Config del método, de lo general a lo específico (las últimas sobrescriben a las primeras). */
+export const CONFIG_FILES = ['_bmad/core/config.yaml', '_bmad/bmm/config.yaml', 'bmad/core/config.yaml', 'bmad/bmm/config.yaml', '.bmad-core/core-config.yaml'];
 export const MAX_FILE_SIZE = 1024 * 1024;
 
 /** ¿Hace falta el contenido de este archivo para el análisis? (el resto basta con nombre y fecha) */
@@ -88,14 +89,15 @@ export function buildScanContext(input: AnalyzeInput): ScanContext {
 
   // Configuración del método
   let config: Record<string, string> = {};
+  const used: string[] = [];
   for (const c of CONFIG_FILES) {
     const f = byPath.get(c);
     if (!f?.content) continue;
     try {
       const doc: any = yaml.load(f.content) ?? {};
-      config = { _file: c };
-      for (const [k, v] of Object.entries(doc)) if (typeof v !== 'object') config[k] = String(v);
-      break;
+      used.push(c);
+      for (const [k, v] of Object.entries(doc)) if (v !== null && typeof v !== 'object' && String(v).trim() !== '') config[k] = String(v).trim();
+      config._file = used.join(', ');
     } catch {
       alerts.push({ level: 'warning', message: `No se pudo leer ${c}` });
     }

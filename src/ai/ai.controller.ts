@@ -1,7 +1,7 @@
 import { BadRequestException, Body, Controller, Headers, HttpCode, Post, Res, UnauthorizedException } from '@nestjs/common';
 import type { Response } from 'express';
 import Anthropic from '@anthropic-ai/sdk';
-import { AiContext, AiTask, BASE_INSTRUCTIONS, BUDGETS, QUICK_TASK_MAX_TOKENS, projectContext, taskInstructions } from './ai.prompts';
+import { AiContext, AiTask, baseInstructions, BUDGETS, QUICK_TASK_MAX_TOKENS, projectContext, taskInstructions } from './ai.prompts';
 import { GroqError, groqModels, groqStream } from './groq.client';
 
 type Provider = 'groq' | 'claude';
@@ -92,7 +92,7 @@ export class AiController {
         const r = await groqStream({
           key,
           model: body?.model || 'openai/gpt-oss-120b',
-          system: [BASE_INSTRUCTIONS, context, extra].filter(Boolean).join('\n\n'),
+          system: [baseInstructions(ctx), context, extra].filter(Boolean).join('\n\n'),
           messages,
           maxTokens: GROQ_MAX_TOKENS[task],
           onText: (t) => !closed && send({ type: 'text', text: t }),
@@ -102,7 +102,7 @@ export class AiController {
       } else {
         const client = new Anthropic({ apiKey: key, maxRetries: 1, timeout: 55_000 });
         const system: Anthropic.TextBlockParam[] = [
-          { type: 'text', text: BASE_INSTRUCTIONS },
+          { type: 'text', text: baseInstructions(ctx) },
           // Bloque grande y estable: se cachea entre turnos del chat (prompt caching)
           { type: 'text', text: context, cache_control: { type: 'ephemeral' } },
         ];

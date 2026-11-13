@@ -1,6 +1,6 @@
 /** Contexto del proyecto que envía el frontend (ya resumido). */
 export interface AiContext {
-  project?: { name?: string; version?: string; commandStyle?: string; storiesDir?: string; sprintStatusFile?: string };
+  project?: { name?: string; version?: string; commandStyle?: string; storiesDir?: string; sprintStatusFile?: string; communicationLanguage?: string; documentLanguage?: string };
   stats?: Record<string, unknown>;
   epics?: { number: number; title: string; status: string; progress: number; description?: string }[];
   stories?: { id: string; title: string; status: string; tasksDone?: number; tasksTotal?: number; warnings?: string[]; relativePath?: string }[];
@@ -29,11 +29,29 @@ export const BUDGETS: Record<'claude' | 'groq', ContextBudget> = {
   groq: { docChars: 3_500, maxDocs: 3, storyChars: 6_000, maxStories: 120, epicDescChars: 120, maxSuggestions: 6, maxAlerts: 12 },
 };
 
+/** Idioma configurado en BMAD (communication_language / document_output_language), saneado. */
+export function cleanLanguage(v?: string): string | undefined {
+  const s = (v ?? '').trim();
+  return /^[\p{L}][\p{L} ()\-_.]{1,39}$/u.test(s) ? s : undefined;
+}
+
+/** Regla de idioma de las respuestas según la configuración de BMAD del proyecto. */
+export function languageRule(ctx: AiContext): string {
+  const lang = cleanLanguage(ctx.project?.communicationLanguage);
+  return lang
+    ? `- Idioma: responde SIEMPRE en ${lang} (communication_language de la configuración BMAD del proyecto), aunque el usuario o los documentos usen otro idioma. Los comandos, rutas, ids y nombres de archivo se mantienen tal cual.`
+    : '- Idioma: el proyecto no define communication_language en su configuración BMAD; responde en el idioma del usuario (por defecto, español).';
+}
+
+export function baseInstructions(ctx: AiContext): string {
+  return `${BASE_INSTRUCTIONS}\n${languageRule(ctx)}`;
+}
+
 export const BASE_INSTRUCTIONS = `Eres el asistente de un dashboard de proyectos que usan BMAD Method (Breakthrough Method for Agile AI-Driven Development).
 Actúas como un Scrum Master / Product Owner experto en BMAD: conoces el ciclo sprint-planning → create-story → story-context/story-ready → dev-story → code-review → story-done → retrospective, y correct-course para cambios de alcance.
 
 Reglas:
-- Responde en el idioma del usuario (por defecto, español). Sé concreto y breve; usa listas cuando ayuden.
+- Sé concreto y breve; usa listas cuando ayuden.
 - Básate en el contexto del proyecto que se te da. Si algo no está en el contexto, dilo en vez de inventarlo (no inventes archivos, historias ni rutas).
 - Refiérete a las historias por su id (p. ej. 1.3) y a las épicas por su número.
 - Cuando recomiendes un comando BMAD, usa exactamente el formato de los "Comandos sugeridos" del contexto (el usuario eligió ese formato).
@@ -104,7 +122,8 @@ Devuelve SOLO un bloque \`\`\`json con este formato exacto (sin texto adicional 
   "references": ["[Source: ruta/documento.md#Sección]"]
 }
 Reglas: entre 3 y 7 criterios de aceptación verificables; cada tarea termina en "(AC: n[, m])" y todos los AC quedan cubiertos; subtareas con dos espacios y guion;
-respeta el alcance de la historia planificada; usa el idioma de los datos del formulario (si están vacíos, español); en references cita solo documentos que aparecen en el contexto.`);
+respeta el alcance de la historia planificada; en references cita solo documentos que aparecen en el contexto.
+Idioma del contenido (title, role, want, benefit, criterios, tareas, devNotes): ${docLanguage(ctx)}. Las claves del JSON se mantienen en inglés.`);
   } else if (task === 'review-story') {
     parts.push(`## Tarea: revisar una especificación de historia antes de pasarla a desarrollo
 <borrador>
@@ -112,9 +131,18 @@ ${trunc(ctx.specMarkdown ?? '', b.storyChars)}
 </borrador>
 Evalúa como un PO exigente: claridad de la user story, criterios verificables y completos, cobertura AC↔tareas, tamaño (¿cabe en una sesión de dev-story?),
 coherencia con la épica/PRD/arquitectura del contexto, riesgos y dependencias con otras historias.
+Responde en ${cleanLanguage(ctx.project?.communicationLanguage) ?? 'el idioma del usuario'}.
 Formato: un veredicto en una línea (Lista para desarrollo / Necesita cambios), luego "Problemas" y "Sugerencias" como listas, y si aplica criterios reescritos.`);
   }
   return parts.join('\n\n');
+}
+
+function docLanguage(ctx: AiContext): string {
+  const doc = cleanLanguage(ctx.project?.documentLanguage);
+  if (doc) return `${doc} (document_output_language de la configuración BMAD)`;
+  const com = cleanLanguage(ctx.project?.communicationLanguage);
+  if (com) return `${com} (communication_language de la configuración BMAD)`;
+  return 'el idioma de los datos del formulario (si están vacíos, español)';
 }
 
 export const QUICK_TASK_MAX_TOKENS: Record<AiTask, number> = {

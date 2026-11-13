@@ -39,6 +39,8 @@ y el servidor la reenvía al proveedor en cada petición sin almacenarla ni regi
 - **Chat sobre el proyecto**: conoce épicas, historias, alertas y comandos sugeridos (en el formato elegido); opcionalmente PRD, arquitectura, UX y épicas.
 - **Preguntar sobre una historia** desde su detalle, con su markdown en contexto.
 - **✨ Redactar con IA** y **✨ Revisar con IA** en Nueva historia.
+- **Idioma desde BMAD**: las respuestas usan `communication_language` y las historias redactadas `document_output_language`
+  (de `_bmad/core/config.yaml` y `_bmad/bmm/config.yaml`; el de bmm prevalece). Sin configuración, responde en el idioma del usuario.
 - Errores claros: key inválida, sin créditos (Claude), límite por minuto/día o petición demasiado grande (Groq).
 
 Endpoints: `POST /api/ai/validate` (devuelve los modelos disponibles) y `POST /api/ai/chat` (stream NDJSON), con `provider` en el cuerpo y la key en la cabecera `x-ai-key`.

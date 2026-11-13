@@ -1506,7 +1506,10 @@
   async function buildAiContext({ includeDocs = false, focusId = null, specDraft = null, specMarkdown = null } = {}) {
     const d = state.data;
     const ctx = {
-      project: { name: d.projectName, version: d.version, commandStyle: d.commandStyle, storiesDir: d.storiesDirRelative, sprintStatusFile: d.sprintStatusFile },
+      project: {
+        name: d.projectName, version: d.version, commandStyle: d.commandStyle, storiesDir: d.storiesDirRelative, sprintStatusFile: d.sprintStatusFile,
+        communicationLanguage: d.config?.communication_language, documentLanguage: d.config?.document_output_language,
+      },
       stats: { ...d.stats },
       epics: d.epics.map((e) => ({ number: e.number, title: e.title, status: e.status, progress: e.progress, description: e.description })),
       stories: d.stories.map((s) => ({ id: s.id, title: s.title, status: s.status, tasksDone: s.tasksDone, tasksTotal: s.tasksTotal, warnings: s.warnings, relativePath: s.relativePath })),
@@ -1639,6 +1642,7 @@
           <select id="ai-model">${aiModels(prov).map((v) => `<option value="${esc(v)}" ${v === model ? 'selected' : ''}>${esc(MODEL_LABELS[v] || v)}</option>`).join('')}</select>
           ${canDocs ? `<label class="toggle" title="${prov === 'groq' ? 'En Groq gratis se envía un extracto corto de cada documento para no superar el límite de tokens por minuto' : 'Envía PRD, arquitectura, UX y épicas como contexto (más preciso, más tokens)'}"><input type="checkbox" id="ai-docs" ${ai.includeDocs ? 'checked' : ''}/> Incluir PRD y arquitectura${prov === 'groq' ? ' (extracto)' : ''}</label>` : '<span class="muted small-text">Vista guardada: sin documentos de planificación</span>'}
           <span class="spacer"></span>
+          <span class="muted small-text" title="${d.config?.communication_language ? 'communication_language en ' + esc(d.config._file || 'la configuración BMAD') : 'El proyecto no define communication_language'}">🌐 ${d.config?.communication_language ? esc(d.config.communication_language) + ' (BMAD)' : 'Idioma del usuario'}</span>
           <button class="btn small ghost" id="ai-new">Nueva conversación</button>
           <span class="muted small-text" title="API key de ${prov === 'groq' ? 'Groq' : 'Anthropic'}">🔑 ${esc(aiKey.masked(key))}</span>
           <button class="btn small ghost" id="ai-key-clear">Quitar key</button>
