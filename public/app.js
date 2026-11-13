@@ -13,7 +13,7 @@
     contexted: 'Con contexto',
   };
   const VERSION_LABEL = { v6: 'BMAD v6', 'v6-alpha': 'BMAD v6 (alpha)', v4: 'BMAD v4', unknown: 'BMAD (no detectado)' };
-  const TABS = ['resumen', 'tablero', 'epicas', 'comandos', 'nueva', 'alertas'];
+  const TABS = ['resumen', 'tablero', 'epicas', 'comandos', 'nueva', 'alertas', 'asistente'];
   const STORY_FILE_RE = /^(\d+)[-.](\d+)(?:[-.](.+))?\.md$/i;
   const EPICS_FILE_RE = /^(epics?|epic[-_ ]?\d+.*|.*[-_]epics?)\.md$/i;
   const HAS_FS_ACCESS = typeof window.showDirectoryPicker === 'function';
@@ -32,6 +32,7 @@
     history: null,
     lastSync: null,
     busy: false,
+    ai: { convo: [], focus: null, prefill: '', model: null, includeDocs: true, streaming: null },
   };
 
   const $ = (sel, el = document) => el.querySelector(sel);
@@ -182,6 +183,7 @@
     const label = all[0].webkitRelativePath.split('/')[0];
     const files = [];
     const markers = new Set();
+    const raw = new Map();
     const maxSize = state.config.scan.maxFileSize;
     for (const file of all) {
       const parts = file.webkitRelativePath.split('/').slice(1);
@@ -195,8 +197,9 @@
       const f = { path: rel, mtime: file.lastModified, size: file.size };
       if (file.size <= maxSize && (isConfig || needsContent(rel))) f.content = await file.text();
       files.push(f);
+      raw.set(rel, file);
     }
-    return { label, files, markers: [...markers] };
+    return { label, files, markers: [...markers], raw };
   }
 
   async function getFileHandle(root, rel, create) {
@@ -296,8 +299,8 @@
     if (!e.target.files.length) return;
     setHint('#pick-hint', 'Leyendo archivos…');
     try {
-      const { label, files, markers } = await readFileList(e.target.files);
-      state.source = { kind: 'browser', handle: null, label, files: new Map(files.map((f) => [f.path, f])), markers };
+      const { label, files, markers, raw } = await readFileList(e.target.files);
+      state.source = { kind: 'browser', handle: null, label, files: new Map(files.map((f) => [f.path, f])), markers, raw };
       await enterDashboard();
     } catch (err) { setHint('#pick-hint', err.message, 'err'); }
     e.target.value = '';
@@ -698,8 +701,9 @@
     const tab = currentTab();
     document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
     const view = $('#view');
-    if (!(tab === 'nueva' && keepScroll && $('#spec-form'))) {
-      ({ resumen: renderSummary, tablero: renderBoard, epicas: renderEpics, comandos: renderCommands, nueva: renderSpec, alertas: renderAlerts })[tab](view, d);
+    const editing = keepScroll && ((tab === 'nueva' && $('#spec-form')) || (tab === 'asistente' && $('#ai-chat')));
+    if (!editing) {
+      ({ resumen: renderSummary, tablero: renderBoard, epicas: renderEpics, comandos: renderCommands, nueva: renderSpec, alertas: renderAlerts, asistente: renderAssistant })[tab](view, d);
     }
     $('#foot').textContent = `${d.scannedFiles} archivos analizados · sprint-status: ${d.sprintStatusFile || 'no encontrado'} · historias en ${d.storiesDirRelative} · actualizado ${new Date(d.generatedAt).toLocaleTimeString()}`;
     renderSyncState();
@@ -996,7 +1000,9 @@
     view.innerHTML = `
       <div class="spec">
         <div class="panel">
-          <div class="panel-head"><h2>Especificación de nueva historia</h2></div>
+          <div class="panel-head"><h2>Especificación de nueva historia</h2><span class="spacer"></span>
+            <button class="btn ai" type="button" id="ai-draft" title="Claude completa la historia usando la épica, el PRD y la arquitectura">✨ Redactar con Claude</button></div>
+          <div id="ai-draft-status" class="ai-status hidden"></div>
           <form id="spec-form" class="form-grid" autocomplete="off">
             <div>
               <label>Épica</label>
@@ -1049,6 +1055,8 @@
         <div class="panel preview">
           <div class="panel-head"><h2>Vista previa</h2><span class="spacer"></span><span class="mono muted" id="spec-file" style="font-size:12px"></span></div>
           <ul class="checks" id="spec-checks"></ul>
+          <div class="actions" style="margin:0 0 10px"><button class="btn ai small" type="button" id="ai-review-btn">✨ Revisar con Claude</button></div>
+          <div id="ai-review" class="ai-review md hidden"></div>
           <pre id="spec-md"></pre>
           <div class="actions">
             ${readOnly() ? '' : `<button class="btn primary" id="spec-save">${saveLabel}</button>`}
@@ -1219,6 +1227,64 @@
       } catch { /* sin conexión */ }
     }
 
+    // ---- Claude: redactar y revisar ----
+    const needKey = () => {
+      if (aiKey.get()) return false;
+      toast('Configura tu API key de Anthropic en la pestaña Asistente', true);
+      location.hash = 'asistente';
+      return true;
+    };
+    $('#ai-draft').addEventListener('click', async () => {
+      if (needKey()) return;
+      const btn = $('#ai-draft');
+      const status = $('#ai-draft-status');
+      const v = values();
+      const e = epicInfo();
+      const planned = e?.plannedStories.find((x) => x.id === F('planned').value) || e?.plannedStories.find((x) => x.number === v.number);
+      const specDraft = {
+        epic: v.epic, epicTitle: e?.title, epicSource: e?.sourceFile, storyNumber: v.number,
+        plannedStory: planned ? { id: planned.id, title: planned.title, body: planned.body } : undefined,
+        title: v.title, role: v.role, want: v.want, benefit: v.benefit,
+        acceptanceCriteria: v.acceptanceCriteria, tasks: v.tasks, devNotes: v.devNotes, references: v.references,
+        storiesDir: ctx.storiesDir, template: v.template,
+      };
+      if (!v.title.trim() && !planned) { toast('Escribe al menos un título o elige una historia planificada', true); return; }
+      btn.disabled = true;
+      status.classList.remove('hidden');
+      status.textContent = 'Claude está leyendo la épica, el PRD y la arquitectura…';
+      try {
+        const context = await buildAiContext({ includeDocs: state.source.kind !== 'cloud', specDraft });
+        const r = await aiStream({ task: 'draft-story', context, onText: (full) => { status.textContent = `Claude está redactando… ${full.length} caracteres`; } });
+        const out = extractJson(r.text);
+        if (out.title) F('title').value = out.title;
+        if (out.role) F('role').value = out.role;
+        if (out.want) F('want').value = out.want;
+        if (out.benefit) F('benefit').value = String(out.benefit).replace(/\.$/, '');
+        if (Array.isArray(out.acceptanceCriteria)) F('acceptanceCriteria').value = out.acceptanceCriteria.join('\n');
+        if (out.tasks) F('tasks').value = Array.isArray(out.tasks) ? out.tasks.join('\n') : out.tasks;
+        if (out.devNotes) F('devNotes').value = out.devNotes;
+        if (Array.isArray(out.references)) F('references').value = out.references.join('\n');
+        status.textContent = `✓ Borrador generado por Claude. Revísalo antes de guardar. ${usageLine(r.usage)}`;
+        schedule();
+      } catch (err) {
+        status.innerHTML = `<span class="hint err">${esc(err instanceof SyntaxError ? 'Claude no devolvió un JSON válido. Inténtalo de nuevo.' : err.message)}</span>`;
+      } finally { btn.disabled = false; }
+    });
+    $('#ai-review-btn').addEventListener('click', async () => {
+      if (needKey() || !lastPreview) { if (!lastPreview) toast('Escribe la historia antes de revisarla', true); return; }
+      const btn = $('#ai-review-btn');
+      const box = $('#ai-review');
+      btn.disabled = true;
+      box.classList.remove('hidden');
+      box.innerHTML = '<p class="muted">Claude está revisando la historia…</p>';
+      try {
+        const context = await buildAiContext({ includeDocs: state.source.kind !== 'cloud', specMarkdown: lastPreview.markdown });
+        const r = await aiStream({ task: 'review-story', context, onText: (full) => { box.innerHTML = renderMd(full); } });
+        box.innerHTML = renderMd(r.text) + `<p class="muted small-text">${usageLine(r.usage)}</p>`;
+      } catch (err) { box.innerHTML = `<p class="hint err">${esc(err.message)}</p>`; }
+      finally { btn.disabled = false; }
+    });
+
     preview();
     loadSavedSpecs();
   }
@@ -1276,7 +1342,10 @@
           ${p?.fileList?.length ? `<h3 style="margin-top:12px">Archivos tocados</h3><ul class="mono" style="font-size:12px;padding-left:18px">${p.fileList.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : ''}
         </div>
       </div>
-      ${!p && s && !readOnly() ? `<div class="actions"><button class="btn primary" id="create-from">Crear especificación de esta historia</button></div>` : ''}
+      <div class="actions">
+        <button class="btn ai" id="ask-claude">✨ Preguntar a Claude sobre esta historia</button>
+        ${!p && s && !readOnly() ? `<button class="btn primary" id="create-from">Crear especificación de esta historia</button>` : ''}
+      </div>
       ${markdown ? `
         <div class="actions"><button class="btn small" id="toggle-raw">Ver markdown original</button><button class="btn small ghost" id="copy-raw">Copiar</button>${p ? `<button class="btn small ghost" data-copy="${esc(p.relativePath)}">Copiar ruta</button>` : ''}</div>
         <div class="md" id="md-render">${renderMd(markdown)}</div>
@@ -1286,6 +1355,12 @@
     body.querySelectorAll('[data-story]').forEach((b) => b.remove());
     $('#toggle-raw')?.addEventListener('click', () => { $('#md-render').classList.toggle('hidden'); $('#md-raw').classList.toggle('hidden'); });
     $('#copy-raw')?.addEventListener('click', () => copy(markdown));
+    $('#ask-claude')?.addEventListener('click', () => {
+      closeModal();
+      state.ai.focus = id;
+      state.ai.prefill = `Explícame el estado de la historia ${id} y qué falta para terminarla. ¿Cuál es el siguiente comando BMAD que debo ejecutar?`;
+      if (location.hash === '#asistente') render(); else location.hash = 'asistente';
+    });
     $('#create-from')?.addEventListener('click', () => {
       closeModal();
       const us = parseUserStory(planned?.userStory || '');
@@ -1354,6 +1429,257 @@
     closeList(); closeTable();
     if (inCode) html += '</pre>';
     return html;
+  }
+
+  // =====================================================================
+  //  Asistente con Claude (API key de cada usuario, solo en su navegador)
+  // =====================================================================
+  const AI_MODELS = [
+    ['claude-sonnet-5-5', 'Claude Sonnet 5.5 (recomendado)'],
+    ['claude-opus-5-5', 'Claude Opus 5.5 (más capaz)'],
+    ['claude-haiku-5-5', 'Claude Haiku 5.5 (más rápido)'],
+  ];
+  const aiKey = {
+    get() { try { return sessionStorage.getItem('bmad.anthropicKey') || localStorage.getItem('bmad.anthropicKey') || ''; } catch { return ''; } },
+    set(k, remember) {
+      try {
+        sessionStorage.removeItem('bmad.anthropicKey'); localStorage.removeItem('bmad.anthropicKey');
+        (remember ? localStorage : sessionStorage).setItem('bmad.anthropicKey', k);
+      } catch { /* sin storage */ }
+    },
+    clear() { try { sessionStorage.removeItem('bmad.anthropicKey'); localStorage.removeItem('bmad.anthropicKey'); } catch { /* */ } },
+    masked(k) { return k ? `${k.slice(0, 7)}…${k.slice(-4)}` : ''; },
+  };
+
+  /** Lee un archivo del proyecto (para dar contexto a Claude). */
+  async function readProjectFile(rel) {
+    const src = state.source;
+    try {
+      if (src.kind === 'browser') {
+        const cached = src.files.get(rel)?.content;
+        if (cached !== undefined) return cached;
+        if (src.handle) return await (await (await getFileHandle(src.handle, rel, false)).getFile()).text();
+        if (src.raw?.get(rel)) return await src.raw.get(rel).text();
+        return null;
+      }
+      if (src.kind === 'local') return (await api('/api/local/story?' + q({ path: src.path, file: rel }))).markdown;
+    } catch { /* no disponible */ }
+    return null;
+  }
+
+  /** Documentos de planificación para el contexto: PRD, arquitectura, UX, brief y épicas. */
+  async function planningDocs() {
+    const d = state.data;
+    const wanted = ['prd', 'architecture', 'ux', 'brief', 'epics', 'context'];
+    const out = [];
+    for (const type of wanted) {
+      const a = d.artifacts.find((x) => x.type === type);
+      if (!a || !/\.md$/i.test(a.relativePath)) continue;
+      const content = await readProjectFile(a.relativePath);
+      if (content) out.push({ path: a.relativePath, content });
+    }
+    return out;
+  }
+
+  async function buildAiContext({ includeDocs = false, focusId = null, specDraft = null, specMarkdown = null } = {}) {
+    const d = state.data;
+    const ctx = {
+      project: { name: d.projectName, version: d.version, commandStyle: d.commandStyle, storiesDir: d.storiesDirRelative, sprintStatusFile: d.sprintStatusFile },
+      stats: { ...d.stats },
+      epics: d.epics.map((e) => ({ number: e.number, title: e.title, status: e.status, progress: e.progress, description: e.description })),
+      stories: d.stories.map((s) => ({ id: s.id, title: s.title, status: s.status, tasksDone: s.tasksDone, tasksTotal: s.tasksTotal, warnings: s.warnings, relativePath: s.relativePath })),
+      suggestions: d.suggestions.map((s) => ({ priority: s.priority, title: s.title, steps: s.steps, reason: s.reason })),
+      alerts: d.alerts.filter((a) => a.level !== 'info').map((a) => a.message),
+    };
+    if (includeDocs) ctx.docs = await planningDocs();
+    if (focusId) {
+      const p = d.details?.[focusId];
+      const md = p ? await readProjectFile(p.relativePath) : null;
+      const planned = d.specContext?.plannedEpics.flatMap((e) => e.plannedStories).find((x) => x.id === focusId);
+      const text = md || (planned ? `### Story ${planned.id}: ${planned.title}\n\n${planned.body}` : null);
+      if (text) ctx.focusStory = { id: focusId, markdown: text };
+    }
+    if (specDraft) ctx.specDraft = specDraft;
+    if (specMarkdown) ctx.specMarkdown = specMarkdown;
+    return ctx;
+  }
+
+  /** Llama a /api/ai/chat y procesa el stream NDJSON. */
+  async function aiStream({ task = 'chat', messages = [], context, onText, signal }) {
+    const key = aiKey.get();
+    if (!key) throw Object.assign(new Error('Configura tu API key de Anthropic en la pestaña Asistente.'), { needsKey: true });
+    const res = await fetch('/api/ai/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-anthropic-key': key },
+      body: JSON.stringify({ task, model: state.ai.model || AI_MODELS[0][0], messages, context }),
+      signal,
+    });
+    if (!res.ok || !res.body) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.message || `Error ${res.status}`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', text = '', done = null;
+    for (;;) {
+      const { value, done: end } = await reader.read();
+      if (end) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.type === 'text') { text += ev.text; onText?.(text, ev.text); }
+        else if (ev.type === 'done') done = ev;
+        else if (ev.type === 'error') throw new Error(ev.message);
+      }
+    }
+    return { text, usage: done?.usage, stopReason: done?.stopReason, model: done?.model };
+  }
+
+  function extractJson(text) {
+    const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+    const raw = fenced ? fenced[1] : text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1);
+    return JSON.parse(raw);
+  }
+  const usageLine = (u) => (u ? `${u.input + u.cacheRead + u.cacheWrite} tokens de entrada${u.cacheRead ? ` (${u.cacheRead} desde caché)` : ''} · ${u.output} de salida` : '');
+
+  function keySetupHtml() {
+    return `
+      <div class="panel ai-setup">
+        <h2>✨ Conecta tu cuenta de Claude</h2>
+        <p class="muted small-text">El asistente usa la API de Claude con <b>tu propia API key</b>. Se guarda solo en este navegador y se envía en cada petición al servidor del dashboard, que la reenvía a Anthropic sin almacenarla. El uso se factura en tu cuenta de Anthropic.</p>
+        <p class="small-text">Crea una key en <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com/settings/keys</a> (console.anthropic.com → Settings → API Keys).</p>
+        <form id="ai-key-form" class="account-row" style="margin-top:10px">
+          <input type="password" id="ai-key-input" placeholder="sk-ant-…" autocomplete="off" spellcheck="false" style="max-width:420px" />
+          <label class="toggle"><input type="checkbox" id="ai-key-remember" checked /> Recordar en este navegador</label>
+          <button class="btn primary" type="submit">Guardar y verificar</button>
+        </form>
+        <div id="ai-key-hint" class="hint"></div>
+      </div>`;
+  }
+  function bindKeySetup(onDone) {
+    $('#ai-key-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const k = $('#ai-key-input').value.trim();
+      if (!/^sk-ant-/.test(k)) return setHint('#ai-key-hint', 'La key debe empezar por "sk-ant-".', 'err');
+      setHint('#ai-key-hint', 'Verificando…');
+      try {
+        const r = await fetch('/api/ai/validate', { method: 'POST', headers: { 'x-anthropic-key': k } });
+        const b = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(b.message || `Error ${r.status}`);
+        aiKey.set(k, $('#ai-key-remember').checked);
+        toast('API key verificada');
+        onDone();
+      } catch (err) { setHint('#ai-key-hint', err.message, 'err'); }
+    });
+  }
+
+  // ---------------- Pestaña Asistente ----------------
+  function renderAssistant(view, d) {
+    const key = aiKey.get();
+    if (!key) {
+      view.innerHTML = keySetupHtml();
+      bindKeySetup(() => renderAssistant(view, d));
+      return;
+    }
+    const ai = state.ai;
+    ai.model = ai.model || store.get('bmad.aiModel', AI_MODELS[0][0]);
+    const focus = ai.focus ? d.stories.find((s) => s.id === ai.focus) : null;
+    const quick = [
+      '¿Qué debería hacer ahora?',
+      'Resume el estado del sprint en 5 líneas',
+      '¿Qué riesgos o bloqueos ves?',
+      'Prepara el plan para la siguiente historia del backlog',
+      'Explica los hallazgos de revisión pendientes y cómo resolverlos',
+    ];
+    const canDocs = state.source.kind !== 'cloud';
+    view.innerHTML = `
+      <div class="ai-wrap">
+        <div class="ai-toolbar">
+          <h2>✨ Asistente</h2>
+          <select id="ai-model">${AI_MODELS.map(([v, l]) => `<option value="${v}" ${v === ai.model ? 'selected' : ''}>${l}</option>`).join('')}</select>
+          ${canDocs ? `<label class="toggle" title="Envía PRD, arquitectura, UX y épicas como contexto (más preciso, más tokens)"><input type="checkbox" id="ai-docs" ${ai.includeDocs ? 'checked' : ''}/> Incluir PRD y arquitectura</label>` : '<span class="muted small-text">Vista guardada: sin documentos de planificación</span>'}
+          <span class="spacer"></span>
+          <button class="btn small ghost" id="ai-new">Nueva conversación</button>
+          <span class="muted small-text" title="API key de Anthropic">🔑 ${esc(aiKey.masked(key))}</span>
+          <button class="btn small ghost" id="ai-key-clear">Quitar key</button>
+        </div>
+        <div class="ai-chat panel" id="ai-chat">
+          <div id="ai-messages" class="ai-messages"></div>
+          ${ai.convo.length ? '' : `<div class="ai-empty" id="ai-empty"><p class="muted">Pregunta lo que quieras sobre <b>${esc(d.projectName)}</b>. Claude conoce el estado de todas las historias, las alertas y los comandos sugeridos${canDocs ? ', y puede leer el PRD y la arquitectura' : ''}.</p>
+            <div class="chips">${quick.map((t) => `<button class="chip" data-quick="${esc(t)}">${esc(t)}</button>`).join('')}</div></div>`}
+        </div>
+        <form id="ai-form" class="ai-input">
+          ${focus ? `<div class="ai-focus"><span class="tag">Historia ${esc(focus.id)}</span> ${esc(focus.title)} en contexto <button type="button" class="x" id="ai-unfocus" title="Quitar">×</button></div>` : ''}
+          <div class="row">
+            <textarea id="ai-text" rows="2" placeholder="Escribe tu pregunta… (Enter para enviar, Shift+Enter para nueva línea)"></textarea>
+            <button class="btn primary" type="submit" id="ai-send">Enviar</button>
+            <button class="btn hidden" type="button" id="ai-stop">Detener</button>
+          </div>
+          <div class="muted small-text" id="ai-usage"></div>
+        </form>
+      </div>`;
+
+    const list = $('#ai-messages');
+    const drawMessages = () => {
+      list.innerHTML = ai.convo.map((m, i) => m.role === 'user'
+        ? `<div class="msg user"><div class="bubble">${esc(m.content).replace(/\n/g, '<br>')}</div></div>`
+        : `<div class="msg assistant"><div class="bubble md">${renderMd(m.content || '…')}</div>${m.content ? `<div class="msg-actions"><button class="btn small ghost" data-copymsg="${i}">Copiar</button></div>` : ''}</div>`).join('');
+      list.querySelectorAll('[data-copymsg]').forEach((b) => b.addEventListener('click', () => copy(ai.convo[Number(b.dataset.copymsg)].content)));
+      const chat = $('#ai-chat'); chat.scrollTop = chat.scrollHeight;
+    };
+    drawMessages();
+
+    const text = $('#ai-text');
+    if (ai.prefill) { text.value = ai.prefill; ai.prefill = ''; }
+    text.focus();
+
+    async function send(content) {
+      if (!content.trim() || ai.streaming) return;
+      $('#ai-empty')?.remove();
+      ai.convo.push({ role: 'user', content });
+      const reply = { role: 'assistant', content: '' };
+      ai.convo.push(reply);
+      drawMessages();
+      text.value = '';
+      const ctrl = new AbortController();
+      ai.streaming = ctrl;
+      $('#ai-send').classList.add('hidden'); $('#ai-stop').classList.remove('hidden');
+      $('#ai-usage').textContent = 'Claude está pensando…';
+      try {
+        const context = await buildAiContext({ includeDocs: canDocs && ai.includeDocs, focusId: ai.focus });
+        const history = ai.convo.slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
+        let last = 0;
+        const r = await aiStream({
+          task: 'chat', messages: history, context, signal: ctrl.signal,
+          onText: (full) => {
+            reply.content = full;
+            if (Date.now() - last > 60) { last = Date.now(); const b = list.lastElementChild?.querySelector('.bubble'); if (b) { b.innerHTML = renderMd(full); const chat = $('#ai-chat'); chat.scrollTop = chat.scrollHeight; } }
+          },
+        });
+        reply.content = r.text;
+        $('#ai-usage').textContent = usageLine(r.usage) + (r.stopReason === 'max_tokens' ? ' · respuesta recortada por longitud' : '');
+      } catch (err) {
+        if (err.name === 'AbortError') { reply.content = (reply.content || '') + '\n\n_(detenido)_'; $('#ai-usage').textContent = 'Respuesta detenida'; }
+        else { ai.convo.splice(ai.convo.indexOf(reply), 1); $('#ai-usage').innerHTML = `<span class="hint err">${esc(err.message)}</span>`; if (/API key/i.test(err.message) && /inválida/i.test(err.message)) { aiKey.clear(); } }
+      } finally {
+        ai.streaming = null;
+        if ($('#ai-send')) { $('#ai-send').classList.remove('hidden'); $('#ai-stop').classList.add('hidden'); drawMessages(); }
+      }
+    }
+
+    $('#ai-form').addEventListener('submit', (e) => { e.preventDefault(); send(text.value); });
+    text.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(text.value); } });
+    $('#ai-stop').addEventListener('click', () => ai.streaming?.abort());
+    view.querySelectorAll('[data-quick]').forEach((b) => b.addEventListener('click', () => send(b.dataset.quick)));
+    $('#ai-model').addEventListener('change', (e) => { ai.model = e.target.value; store.set('bmad.aiModel', ai.model); });
+    $('#ai-docs')?.addEventListener('change', (e) => { ai.includeDocs = e.target.checked; });
+    $('#ai-new').addEventListener('click', () => { ai.streaming?.abort(); ai.convo = []; ai.focus = null; renderAssistant(view, d); });
+    $('#ai-unfocus')?.addEventListener('click', () => { ai.focus = null; renderAssistant(view, d); });
+    $('#ai-key-clear').addEventListener('click', () => { aiKey.clear(); toast('API key eliminada de este navegador'); renderAssistant(view, d); });
   }
 
   // ---------------- Arranque ----------------

@@ -94,6 +94,7 @@ export class LocalFsService {
 
   async storyMarkdown(input: string, relativePath: string) {
     const root = await this.resolveRoot(input);
+    if (!/\.(md|ya?ml)$/i.test(relativePath ?? '')) throw new BadRequestException('Solo se pueden leer archivos .md o .yaml');
     const abs = path.resolve(root, relativePath);
     if (!abs.startsWith(root + path.sep)) throw new BadRequestException('Ruta fuera del proyecto');
     try {

@@ -26,6 +26,20 @@ El dashboard se actualiza solo cuando cambian las historias (activado por defect
 Al detectar cambios muestra un aviso (p. ej. `1.3: En progreso → En revisión`), resalta las historias afectadas,
 añade la entrada al panel **Cambios detectados**, recalcula los comandos sugeridos y sincroniza el snapshot.
 
+## Asistente con Claude
+
+Pestaña **✨ Asistente** y botones ✨ en el dashboard, usando la API de Claude con **la API key de cada usuario**
+(se guarda solo en su navegador; el servidor la reenvía a Anthropic en cada petición sin almacenarla ni registrarla).
+
+- **Chat sobre el proyecto**: Claude recibe el estado de épicas e historias, alertas y comandos sugeridos (en el formato elegido)
+  y, opcionalmente, el PRD, la arquitectura, UX y épicas. El contexto del proyecto se cachea entre turnos (prompt caching).
+- **Preguntar sobre una historia**: desde el detalle de una historia, con su markdown completo en contexto.
+- **✨ Redactar con Claude** (Nueva historia): completa título, user story, criterios verificables, tareas con `(AC: n)`, Dev Notes y referencias.
+- **✨ Revisar con Claude**: revisión tipo PO del borrador (veredicto, problemas, sugerencias).
+- Modelos: Claude Sonnet 5.5 (por defecto), Opus 5.5 y Haiku 5.5.
+
+Endpoints: `POST /api/ai/validate` y `POST /api/ai/chat` (stream NDJSON), ambos con la cabecera `x-anthropic-key`.
+
 ## Vistas
 
 - **Resumen**: KPIs, distribución por estado, tendencia del sprint, foco actual, progreso por épica, siguiente paso, actividad y artefactos.
