@@ -1229,7 +1229,7 @@
 
     // ---- Claude: redactar y revisar ----
     const needKey = () => {
-      if (aiReady()) return false;
+      if (aiKey.get()) return false;
       toast('Configura tu API key en la pestaña Asistente', true);
       location.hash = 'asistente';
       return true;
@@ -1466,18 +1466,6 @@
     clear(provider = aiProvider()) { const n = AI_PROVIDERS[provider].keyName; try { sessionStorage.removeItem(n); localStorage.removeItem(n); } catch { /* */ } },
     masked(k) { return k ? `${k.slice(0, 6)}…${k.slice(-4)}` : ''; },
   };
-  /** Groq con la key del servidor (GROQ_KEY): no hace falta pedir key al usuario. */
-  const usesServerKey = (provider = aiProvider()) => provider === 'groq' && !!state.config?.ai?.groqServerKey && !aiKey.get('groq');
-  const aiReady = (provider = aiProvider()) => !!aiKey.get(provider) || usesServerKey(provider);
-  async function loadServerModels() {
-    if (!usesServerKey('groq') || state.ai.serverModelsLoaded) return;
-    state.ai.serverModelsLoaded = true;
-    try {
-      const r = await fetch('/api/ai/validate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: 'groq' }) });
-      const b = await r.json();
-      if (r.ok && Array.isArray(b.models) && b.models.length) store.set('bmad.aiModels.groq', b.models);
-    } catch { /* se usan los modelos por defecto */ }
-  }
   const aiModels = (provider = aiProvider()) => store.get('bmad.aiModels.' + provider, AI_PROVIDERS[provider].defaultModels);
   const aiModel = (provider = aiProvider()) => {
     const saved = store.get('bmad.aiModel.' + provider, null);
@@ -1542,10 +1530,10 @@
   async function aiStream({ task = 'chat', messages = [], context, onText, signal }) {
     const provider = aiProvider();
     const key = aiKey.get(provider);
-    if (!key && !usesServerKey(provider)) throw Object.assign(new Error(`Configura tu API key de ${provider === 'groq' ? 'Groq' : 'Anthropic'} en la pestaña Asistente.`), { needsKey: true });
+    if (!key) throw Object.assign(new Error(`Configura tu API key de ${provider === 'groq' ? 'Groq' : 'Anthropic'} en la pestaña Asistente.`), { needsKey: true });
     const res = await fetch('/api/ai/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(key ? { 'x-ai-key': key } : {}) },
+      headers: { 'Content-Type': 'application/json', 'x-ai-key': key },
       body: JSON.stringify({ provider, task, model: aiModel(provider), messages, context }),
       signal,
     });
@@ -1626,9 +1614,7 @@
   // ---------------- Pestaña Asistente ----------------
   function renderAssistant(view, d) {
     const key = aiKey.get();
-    const serverKey = usesServerKey();
-    if (serverKey && !state.ai.serverModelsLoaded) { loadServerModels().then(() => currentTab() === 'asistente' && !state.ai.streaming && renderAssistant(view, d)); }
-    if (!key && !serverKey) {
+    if (!key) {
       view.innerHTML = keySetupHtml();
       bindKeySetup(() => renderAssistant(view, d));
       return;
@@ -1654,10 +1640,8 @@
           ${canDocs ? `<label class="toggle" title="${prov === 'groq' ? 'En Groq gratis se envía un extracto corto de cada documento para no superar el límite de tokens por minuto' : 'Envía PRD, arquitectura, UX y épicas como contexto (más preciso, más tokens)'}"><input type="checkbox" id="ai-docs" ${ai.includeDocs ? 'checked' : ''}/> Incluir PRD y arquitectura${prov === 'groq' ? ' (extracto)' : ''}</label>` : '<span class="muted small-text">Vista guardada: sin documentos de planificación</span>'}
           <span class="spacer"></span>
           <button class="btn small ghost" id="ai-new">Nueva conversación</button>
-          ${serverKey
-            ? '<span class="muted small-text" title="El servidor usa la variable de entorno GROQ_KEY">🔑 Key del servidor</span>'
-            : `<span class="muted small-text" title="API key de ${prov === 'groq' ? 'Groq' : 'Anthropic'}">🔑 ${esc(aiKey.masked(key))}</span>
-          <button class="btn small ghost" id="ai-key-clear">Quitar key</button>`}
+          <span class="muted small-text" title="API key de ${prov === 'groq' ? 'Groq' : 'Anthropic'}">🔑 ${esc(aiKey.masked(key))}</span>
+          <button class="btn small ghost" id="ai-key-clear">Quitar key</button>
         </div>
         <div class="ai-chat panel" id="ai-chat">
           <div id="ai-messages" class="ai-messages"></div>
@@ -1738,7 +1722,7 @@
     $('#ai-docs')?.addEventListener('change', (e) => { ai.includeDocs = e.target.checked; });
     $('#ai-new').addEventListener('click', () => { ai.streaming?.abort(); ai.convo = []; ai.focus = null; renderAssistant(view, d); });
     $('#ai-unfocus')?.addEventListener('click', () => { ai.focus = null; renderAssistant(view, d); });
-    $('#ai-key-clear')?.addEventListener('click', () => { aiKey.clear(); toast('API key eliminada de este navegador'); renderAssistant(view, d); });
+    $('#ai-key-clear').addEventListener('click', () => { aiKey.clear(); toast('API key eliminada de este navegador'); renderAssistant(view, d); });
   }
 
   // ---------------- Arranque ----------------
