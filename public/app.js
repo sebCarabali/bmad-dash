@@ -131,7 +131,11 @@
     return name.startsWith('.') && name !== '.bmad-output';
   }
 
-  async function readHandle(root) {
+  /**
+   * Lee la carpeta. Con `prev` (lectura anterior) es incremental: solo vuelve a leer el contenido
+   * de los archivos BMAD cuya fecha o tamaño cambió, y devuelve una firma para detectar cambios.
+   */
+  async function readHandle(root, prev) {
     const files = [];
     const markers = [];
     const maxSize = state.config.scan.maxFileSize;
@@ -139,28 +143,36 @@
     if (markers.includes('bmad')) {
       try { await (await root.getDirectoryHandle('bmad')).getDirectoryHandle('bmm'); markers.push('bmad/bmm'); } catch { /* no */ }
     }
+    const load = async (rel, getFile, need) => {
+      const old = prev?.get(rel);
+      if (!need && old) return old; // archivos no BMAD: basta con la metadata de la primera lectura
+      const file = await getFile();
+      const f = { path: rel, mtime: file.lastModified, size: file.size };
+      if (need && file.size <= maxSize) {
+        f.content = old && old.mtime === f.mtime && old.size === f.size && old.content !== undefined ? old.content : await file.text();
+      }
+      return f;
+    };
     async function walk(dir, prefix, depth) {
       for await (const [name, h] of dir.entries()) {
         if (h.kind === 'directory') {
           if (skipDir(name, depth) || depth >= state.config.scan.maxDepth) continue;
           await walk(h, prefix + name + '/', depth + 1);
         } else if (/\.(md|ya?ml)$/i.test(name)) {
-          const file = await h.getFile();
           const rel = prefix + name;
-          const f = { path: rel, mtime: file.lastModified, size: file.size };
-          if (file.size <= maxSize && needsContent(rel)) f.content = await file.text();
-          files.push(f);
+          files.push(await load(rel, () => h.getFile(), needsContent(rel)));
         }
       }
     }
     await walk(root, '', 0);
     for (const c of state.config.scan.configFiles) {
       try {
-        const file = await (await getFileHandle(root, c, false)).getFile();
-        files.push({ path: c, mtime: file.lastModified, size: file.size, content: await file.text() });
+        const fh = await getFileHandle(root, c, false);
+        files.push(await load(c, () => fh.getFile(), true));
       } catch { /* no existe */ }
     }
-    return { files, markers };
+    const signature = files.filter((f) => f.content !== undefined).map((f) => `${f.path}|${f.mtime}|${f.size}`).sort().join('\n') + `#${files.length}`;
+    return { files, markers, signature };
   }
 
   /** Fallback (<input webkitdirectory>): lectura única, sin escritura. */
@@ -214,7 +226,7 @@
   //  Pantalla de inicio
   // =====================================================================
   function showStart(msg) {
-    stopAuto();
+    stopWatching();
     state.source = null;
     state.data = null;
     $('#app').classList.add('hidden');
@@ -455,64 +467,208 @@
   // =====================================================================
   //  Dashboard
   // =====================================================================
-  async function loadData() {
+  /**
+   * Carga los datos de la fuente actual. Con `onlyIfChanged` devuelve null si nada cambió
+   * (firma de archivos idéntica), para no recalcular ni repintar.
+   */
+  async function loadData(onlyIfChanged = false) {
     const src = state.source;
     const style = state.style || undefined;
     if (src.kind === 'local') {
+      if (onlyIfChanged) {
+        const { signature } = await api('/api/local/signature?' + q({ path: src.path }));
+        if (signature === src.signature) return null;
+        src.signature = signature;
+      } else {
+        api('/api/local/signature?' + q({ path: src.path })).then((r) => (src.signature = r.signature)).catch(() => {});
+      }
       return api('/api/local/dashboard?' + q(style ? { path: src.path, style } : { path: src.path }));
     }
     if (src.kind === 'browser') {
       if (src.handle) {
-        const { files, markers } = await readHandle(src.handle);
+        const { files, markers, signature } = await readHandle(src.handle, src.files);
+        if (onlyIfChanged && signature === src.signature) return null;
         src.files = new Map(files.map((f) => [f.path, f]));
         src.markers = markers;
-      }
+        src.signature = signature;
+      } else if (onlyIfChanged) return null;
       return post('/api/analyze', { root: src.label, files: [...src.files.values()], markers: src.markers, style });
     }
     const snap = await api(`/api/projects/${src.projectId}/latest`);
+    if (onlyIfChanged && snap.created_at === src.at) return null;
     src.at = snap.created_at;
     return snap.dashboard;
   }
 
   async function enterDashboard() {
+    stopWatching();
     const key = 'bmad.style.' + (state.source.label || state.source.path || state.source.projectId);
     state.style = store.get(key, null);
     state.styleKey = key;
     state.cloudProjectId = state.source.kind === 'cloud' ? state.source.projectId : null;
     state.history = null;
     state.lastSync = null;
+    state.changes = [];
+    state.flash = new Set();
     state.data = await loadData();
-    if (state.style && state.data.commandStyle !== state.style && readOnly()) state.style = state.data.commandStyle;
     state.style = state.data.commandStyle;
     $('#start').classList.add('hidden');
     $('#app').classList.remove('hidden');
     if (!TABS.includes(location.hash.slice(1))) history.replaceState(null, '', '#resumen');
     render();
-    const canAuto = state.source.kind === 'local' || (state.source.kind === 'browser' && state.source.handle);
-    $('#auto-wrap').classList.toggle('hidden', !canAuto);
-    $('#refresh-btn').classList.toggle('hidden', !canAuto && !readOnly());
-    if (canAuto && store.get('bmad.auto', false)) { $('#auto-refresh').checked = true; startAuto(); } else stopAuto();
+    $('#live-toggle').checked = store.get('bmad.live', true);
+    if ($('#live-toggle').checked) startWatching(); else renderLiveState();
     if (readOnly()) loadHistory(); else syncToCloud();
   }
 
-  async function reload(silent = false) {
-    if (state.busy) return;
-    state.busy = true;
-    try {
-      state.data = await loadData();
-      render(true);
-      if (!silent) toast('Dashboard actualizado');
-      if (!readOnly()) syncToCloud();
-    } catch (err) { if (!silent) toast(err.message, true); }
-    finally { state.busy = false; }
+  // ---------------- Actualización en vivo ----------------
+  /** Compara dos estados y devuelve los cambios por historia. */
+  function diffStories(prev, next) {
+    const before = new Map(prev.stories.map((s) => [s.id, s]));
+    const after = new Set(next.stories.map((s) => s.id));
+    const out = [];
+    for (const s of next.stories) {
+      const o = before.get(s.id);
+      if (!o) out.push({ id: s.id, title: s.title, kind: 'new', to: s.status });
+      else if (o.status !== s.status) out.push({ id: s.id, title: s.title, kind: 'status', from: o.status, to: s.status });
+      else if (o.tasksDone !== s.tasksDone || o.tasksTotal !== s.tasksTotal) out.push({ id: s.id, title: s.title, kind: 'tasks', from: `${o.tasksDone}/${o.tasksTotal}`, to: `${s.tasksDone}/${s.tasksTotal}` });
+      else if (o.pendingReviewItems !== s.pendingReviewItems) out.push({ id: s.id, title: s.title, kind: 'review', from: o.pendingReviewItems, to: s.pendingReviewItems });
+    }
+    for (const o of prev.stories) if (!after.has(o.id)) out.push({ id: o.id, title: o.title, kind: 'removed', from: o.status });
+    return out;
   }
 
-  function startAuto() { stopAuto(); state.autoTimer = setInterval(() => document.visibilityState === 'visible' && reload(true), 15000); }
-  function stopAuto() { if (state.autoTimer) clearInterval(state.autoTimer); state.autoTimer = null; }
+  function describeChange(c) {
+    const st = (x) => STATUS_LABEL[x] ?? x;
+    switch (c.kind) {
+      case 'status': return `${c.id} ${c.title}: ${st(c.from)} → ${st(c.to)}`;
+      case 'new': return `${c.id} ${c.title}: nueva (${st(c.to)})`;
+      case 'tasks': return `${c.id} ${c.title}: tareas ${c.from} → ${c.to}`;
+      case 'review': return `${c.id} ${c.title}: hallazgos de revisión ${c.from} → ${c.to}`;
+      case 'removed': return `${c.id} ${c.title}: ya no aparece en el proyecto`;
+      default: return c.id;
+    }
+  }
 
-  $('#refresh-btn').addEventListener('click', () => reload());
+  /** Aplica un estado nuevo: detecta cambios, avisa, resalta y sincroniza. */
+  function applyData(next, { announce = true } = {}) {
+    const prev = state.data;
+    const changes = prev ? diffStories(prev, next) : [];
+    state.data = next;
+    if (changes.length) {
+      const at = Date.now();
+      state.changes = [...changes.map((c) => ({ ...c, at })), ...(state.changes || [])].slice(0, 30);
+      state.flash = new Set(changes.map((c) => c.id));
+      setTimeout(() => { state.flash = new Set(); document.querySelectorAll('.flash').forEach((el) => el.classList.remove('flash')); }, 4000);
+      if (announce) {
+        const first = describeChange(changes[0]);
+        toast(changes.length === 1 ? `Cambio detectado · ${first}` : `${changes.length} cambios · ${first} (y ${changes.length - 1} más)`);
+      }
+      if (document.visibilityState !== 'visible') {
+        state.unseen = (state.unseen || 0) + changes.length;
+        document.title = `(${state.unseen}) BMAD Dashboard`;
+      }
+    }
+    render(true);
+    if (!readOnly()) syncToCloud();
+    return changes;
+  }
+
+  /** Busca cambios; si hay, recalcula y repinta. `force` = recarga manual. */
+  async function check(force = false) {
+    if (!state.source || !state.data) return;
+    if (state.busy) { state.pending = true; return; }
+    state.busy = true;
+    try {
+      const next = await loadData(!force);
+      if (next) {
+        const changes = applyData(next, { announce: !force });
+        if (force) toast(changes.length ? `Actualizado · ${changes.length} cambio(s)` : 'Sin cambios');
+      }
+      state.liveError = null;
+    } catch (err) {
+      state.liveError = err.message;
+      if (force) toast(err.message, true);
+    } finally {
+      state.busy = false;
+      state.lastCheck = Date.now();
+      renderLiveState();
+      if (state.pending) { state.pending = false; scheduleCheck(300); }
+    }
+  }
+  function scheduleCheck(ms = 400) { clearTimeout(state.checkTimer); state.checkTimer = setTimeout(() => check(), ms); }
+  const reload = (silent = false) => (silent ? check() : check(true));
+
+  /** Vigila la fuente actual: FileSystemObserver / sondeo / Supabase Realtime. */
+  async function startWatching() {
+    stopWatching();
+    const src = state.source;
+    state.watch = { mode: 'none' };
+    if (src.kind === 'browser' && src.handle) {
+      if (typeof window.FileSystemObserver === 'function') {
+        try {
+          const obs = new window.FileSystemObserver(() => scheduleCheck(500));
+          await obs.observe(src.handle, { recursive: true });
+          state.watch = { mode: 'observer', observer: obs, timer: setInterval(() => check(), 30000) };
+        } catch { /* sin observer: sondeo */ }
+      }
+      if (state.watch.mode === 'none') state.watch = { mode: 'poll', timer: setInterval(() => document.visibilityState === 'visible' && check(), 4000) };
+    } else if (src.kind === 'local') {
+      state.watch = { mode: 'poll', timer: setInterval(() => check(), 3000) };
+    } else if (src.kind === 'cloud' && state.sb && state.session) {
+      const channel = state.sb
+        .channel('snapshots-' + src.projectId)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'snapshots', filter: `project_id=eq.${src.projectId}` }, () => { scheduleCheck(200); loadHistory(); })
+        .subscribe((status) => { state.watch.status = status; renderLiveState(); });
+      state.watch = { mode: 'realtime', channel, timer: setInterval(() => check(), 60000) };
+    }
+    renderLiveState();
+  }
+  function stopWatching() {
+    const w = state.watch;
+    if (!w) return;
+    if (w.timer) clearInterval(w.timer);
+    try { w.observer?.disconnect(); } catch { /* ignorar */ }
+    if (w.channel && state.sb) state.sb.removeChannel(w.channel);
+    clearTimeout(state.checkTimer);
+    state.watch = null;
+  }
+
+  function renderLiveState() {
+    const el = $('#live-state');
+    if (!el || !state.source) return;
+    const src = state.source;
+    const canWatch = src.kind === 'local' || (src.kind === 'browser' && src.handle) || (src.kind === 'cloud' && state.session);
+    $('#live-wrap').classList.toggle('hidden', !canWatch);
+    $('#refresh-btn').classList.toggle('hidden', src.kind === 'browser' && !src.handle);
+    if (!canWatch) {
+      el.className = 'live-state off';
+      el.textContent = src.kind === 'browser' ? 'Instantánea · vuelve a cargar la carpeta para actualizar' : '';
+      return;
+    }
+    const w = state.watch;
+    if (!w || w.mode === 'none') { el.className = 'live-state off'; el.textContent = 'Pausado'; el.title = 'Actualización automática desactivada'; return; }
+    if (state.liveError) { el.className = 'live-state err'; el.textContent = 'Error'; el.title = state.liveError; return; }
+    el.className = 'live-state on';
+    el.textContent = 'En vivo';
+    el.title = {
+      observer: 'Vigilando la carpeta: los cambios se detectan al instante',
+      poll: src.kind === 'local' ? 'Revisando la carpeta cada 3 s' : 'Revisando la carpeta cada 4 s',
+      realtime: `Supabase Realtime (${w.status || 'conectando'}): se actualiza cuando otro dispositivo sincroniza`,
+    }[w.mode] + (state.lastCheck ? ` · última revisión ${new Date(state.lastCheck).toLocaleTimeString()}` : '');
+  }
+
+  $('#refresh-btn').addEventListener('click', () => check(true));
   $('#change-btn').addEventListener('click', () => showStart());
-  $('#auto-refresh').addEventListener('change', (e) => { store.set('bmad.auto', e.target.checked); e.target.checked ? startAuto() : stopAuto(); });
+  $('#live-toggle').addEventListener('change', (e) => {
+    store.set('bmad.live', e.target.checked);
+    if (e.target.checked) { startWatching(); check(); } else { stopWatching(); renderLiveState(); }
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (state.unseen) { state.unseen = 0; document.title = 'BMAD Dashboard'; }
+    if (state.watch && state.watch.mode !== 'none') check();
+  });
   $('#style-select').addEventListener('change', async (e) => {
     state.style = e.target.value;
     store.set(state.styleKey, state.style);
@@ -547,6 +703,7 @@
     }
     $('#foot').textContent = `${d.scannedFiles} archivos analizados · sprint-status: ${d.sprintStatusFile || 'no encontrado'} · historias en ${d.storiesDirRelative} · actualizado ${new Date(d.generatedAt).toLocaleTimeString()}`;
     renderSyncState();
+    renderLiveState();
     if (keepScroll) window.scrollTo(0, y);
   }
 
@@ -585,6 +742,7 @@
             </div>`).join('')}</div>
         </div>
         <div class="grid" style="align-content:start">
+          ${changesPanel()}
           <div class="panel">
             <div class="panel-head"><h2>Siguiente paso</h2><span class="spacer"></span><a href="#comandos">Ver todos →</a></div>
             ${next.length ? next.map(suggestionCard).join('') : '<div class="empty">Sin sugerencias.</div>'}
@@ -604,6 +762,7 @@
         </div>
       </div>`;
     renderTrend($('#trend-slot'));
+    $('#clear-changes')?.addEventListener('click', () => { state.changes = []; render(true); });
     bindCommon(view);
   }
 
@@ -663,6 +822,22 @@
     $('#trend-hit', slot).addEventListener('mouseleave', () => { tip.classList.add('hidden'); cross.style.display = 'none'; });
   }
 
+  function changesPanel() {
+    const list = state.changes || [];
+    if (!list.length) return '';
+    const icon = { status: '⇄', new: '＋', tasks: '☑', review: '●', removed: '－' };
+    return `<div class="panel changes">
+      <div class="panel-head"><h2>Cambios detectados</h2><span class="muted">desde que abriste el proyecto</span><span class="spacer"></span><button class="btn small ghost" id="clear-changes">Limpiar</button></div>
+      <div class="list">${list.slice(0, 8).map((c) => `
+        <div class="row-item ${c.kind === 'removed' ? '' : ''}" ${c.kind !== 'removed' ? `data-story="${esc(c.id)}"` : ''}>
+          <span class="chg-ico">${icon[c.kind] || '•'}</span>
+          <div class="grow"><div class="title">${esc(c.id)} · ${esc(c.title)}</div>
+            <div class="meta">${c.kind === 'status' ? `${esc(STATUS_LABEL[c.from] ?? c.from)} → <b>${esc(STATUS_LABEL[c.to] ?? c.to)}</b>` : esc(describeChange(c).split(': ').slice(1).join(': '))}</div></div>
+          <span class="meta">${timeAgo(c.at)}</span>
+        </div>`).join('')}</div>
+    </div>`;
+  }
+
   function artifactsBlock(d) {
     const expected = [['brief', 'Product Brief'], ['prd', 'PRD'], ['ux', 'Diseño UX'], ['architecture', 'Arquitectura'], ['epics', 'Épicas'], ['sprint-status', 'Sprint Status']];
     return `<div class="list">${expected.map(([t, label]) => {
@@ -678,7 +853,7 @@
   const kpi = (label, value, sub) => `<div class="panel kpi"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`;
 
   function storyRow(s) {
-    return `<div class="row-item" data-story="${esc(s.id)}">
+    return `<div class="row-item ${state.flash?.has(s.id) ? 'flash' : ''}" data-story="${esc(s.id)}">
       <span class="tag">${esc(s.id)}</span>
       <div class="grow">
         <div class="title">${esc(s.title)} ${s.warnings.length ? `<span class="warn-ico" title="${esc(s.warnings.join('\n'))}">⚠</span>` : ''}</div>
@@ -705,7 +880,7 @@
         const col = items.filter((s) => s.status === st);
         return `<div class="col"><div class="col-head"><i class="dot" style="background:var(--s-${st})"></i>${STATUS_LABEL[st]}<span class="count">${col.length}</span></div>
           ${col.map((s) => `
-            <div class="card" style="--c:var(--s-${st})" data-story="${esc(s.id)}">
+            <div class="card ${state.flash?.has(s.id) ? 'flash' : ''}" style="--c:var(--s-${st})" data-story="${esc(s.id)}">
               <div class="id">${esc(s.id)} <span class="tag">E${s.epic}</span>${s.warnings.length ? `<span class="warn-ico" title="${esc(s.warnings.join('\n'))}">⚠</span>` : ''}${!s.hasFile && st !== 'backlog' ? '<span class="muted" title="Sin archivo">∅</span>' : ''}</div>
               <div class="t">${esc(s.title)}</div>
               <div class="foot2">

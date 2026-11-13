@@ -12,6 +12,20 @@ un **generador de especificaciones** de historias y el **historial del sprint** 
 | **Ruta local** | Solo al ejecutar la app en tu equipo | Escribes o exploras la ruta; el servidor lee el disco. Deshabilitado en Vercel. |
 | **Nube (Supabase)** | Con sesión iniciada | Cada vez que cambia el estado se guarda un snapshot: tendencia del sprint, último estado visible desde cualquier dispositivo (solo lectura) y especificaciones guardadas. |
 
+## Actualización en vivo
+
+El dashboard se actualiza solo cuando cambian las historias (activado por defecto, interruptor **En vivo** en la barra superior):
+
+| Fuente | Cómo detecta cambios |
+|---|---|
+| Carpeta (Chrome/Edge recientes) | `FileSystemObserver`: al instante |
+| Carpeta (otros navegadores con File System Access) | Revisa fechas/tamaños de los archivos BMAD cada 4 s y solo relee los que cambiaron |
+| Ruta local | `GET /api/local/signature` cada 3 s; recalcula solo si la firma cambia |
+| Vista en la nube | Supabase Realtime sobre `snapshots`: se actualiza cuando otro dispositivo sincroniza |
+
+Al detectar cambios muestra un aviso (p. ej. `1.3: En progreso → En revisión`), resalta las historias afectadas,
+añade la entrada al panel **Cambios detectados**, recalcula los comandos sugeridos y sincroniza el snapshot.
+
 ## Vistas
 
 - **Resumen**: KPIs, distribución por estado, tendencia del sprint, foco actual, progreso por épica, siguiente paso, actividad y artefactos.

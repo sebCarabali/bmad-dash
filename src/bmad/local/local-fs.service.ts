@@ -1,4 +1,5 @@
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -64,6 +65,21 @@ export class LocalFsService {
     }
     if (await exists(path.join(root, 'bmad', 'bmm'))) markers.push('bmad/bmm');
     return { root, source: 'local', files, markers };
+  }
+
+  /**
+   * Firma barata del estado (rutas + fechas + tamaños de los archivos BMAD relevantes),
+   * sin leer contenidos: el frontend la consulta a menudo y solo recalcula si cambia.
+   */
+  async signature(input: string) {
+    const root = await this.resolveRoot(input);
+    const files: VFile[] = [];
+    await walk(root, root, 0, files, false);
+    const relevant = files.filter((f) => needsContent(f.path)).sort((a, b) => a.path.localeCompare(b.path));
+    const hash = createHash('sha1');
+    for (const f of relevant) hash.update(`${f.path}|${Math.round(f.mtime)}|${f.size}\n`);
+    hash.update(`total:${files.length}`);
+    return { signature: hash.digest('hex'), files: relevant.length };
   }
 
   async detect(input: string) {
@@ -143,7 +159,7 @@ export class LocalFsService {
   }
 }
 
-async function walk(root: string, dir: string, depth: number, out: VFile[]) {
+async function walk(root: string, dir: string, depth: number, out: VFile[], withContent = true) {
   if (out.length >= MAX_FILES) return;
   let entries;
   try {
@@ -157,13 +173,13 @@ async function walk(root: string, dir: string, depth: number, out: VFile[]) {
       if (IGNORED_DIRS.includes(e.name) || METHOD_DIRS.includes(e.name)) continue;
       if (depth === 0 && e.name === 'bmad') continue;
       if (e.name.startsWith('.') && !ALLOWED_DOT_DIRS.has(e.name)) continue;
-      if (depth < MAX_DEPTH) await walk(root, abs, depth + 1, out);
+      if (depth < MAX_DEPTH) await walk(root, abs, depth + 1, out, withContent);
     } else if (e.isFile() && /\.(md|ya?ml)$/i.test(e.name)) {
       try {
         const st = await fs.stat(abs);
         const rel = path.relative(root, abs).split(path.sep).join('/');
         const f: VFile = { path: rel, mtime: st.mtimeMs, size: st.size };
-        if (st.size <= MAX_FILE_SIZE && needsContent(rel)) f.content = await fs.readFile(abs, 'utf8');
+        if (withContent && st.size <= MAX_FILE_SIZE && needsContent(rel)) f.content = await fs.readFile(abs, 'utf8');
         out.push(f);
       } catch {
         /* ignorar */

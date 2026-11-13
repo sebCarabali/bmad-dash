@@ -20,6 +20,12 @@ export class LocalController {
     return this.local.dashboard(path, STYLES.includes(style as CommandStyle) ? (style as CommandStyle) : undefined);
   }
 
+  /** Firma del estado para detectar cambios sin recalcular el dashboard. */
+  @Get('signature')
+  signature(@Query('path') path: string) {
+    return this.local.signature(path);
+  }
+
   @Get('story')
   story(@Query('path') path: string, @Query('file') file: string) {
     return this.local.storyMarkdown(path, file);

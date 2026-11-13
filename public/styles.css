@@ -226,3 +226,17 @@ label { font-weight: 500; font-size: 12.5px; color: var(--ink-2); display: block
 .trend-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
 .trend-table td, .trend-table th { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: left; }
 .saved-specs { margin-top: 16px; }
+
+/* ---------- v3: actualización en vivo ---------- */
+.live-state { font-size: 12.5px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
+.live-state::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.live-state.on { color: var(--s-done); }
+.live-state.on::before { background: var(--s-done); animation: pulse 2s infinite; }
+.live-state.err { color: #dc2626; }
+.live-state.err::before { background: #dc2626; }
+.live-state.off { color: var(--muted); font-weight: 400; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(22,163,74,.5); } 70% { box-shadow: 0 0 0 6px rgba(22,163,74,0); } 100% { box-shadow: 0 0 0 0 rgba(22,163,74,0); } }
+@keyframes flash { 0% { box-shadow: 0 0 0 3px var(--accent); background: var(--accent-soft); } 100% { box-shadow: var(--shadow); } }
+.card.flash, .row-item.flash { animation: flash 3.5s ease-out; }
+.changes .chg-ico { width: 22px; height: 22px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; font-size: 12px; flex: none; }
+@media (prefers-reduced-motion: reduce) { .live-state.on::before, .card.flash, .row-item.flash { animation: none; } .card.flash, .row-item.flash { outline: 2px solid var(--accent); } }
