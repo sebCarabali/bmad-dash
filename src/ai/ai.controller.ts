@@ -111,8 +111,18 @@ function friendlyError(err: unknown): { message: string; status?: number } {
       429: 'Límite de uso alcanzado en tu cuenta de Anthropic. Espera un momento.',
       529: 'Claude está saturado en este momento. Reintenta en unos segundos.',
     };
+    // Mensaje real de la API (sin el JSON crudo): { type: 'error', error: { type, message } }
+    const apiMessage: string = (err as any).error?.error?.message ?? (err as any).error?.message ?? err.message ?? '';
+    if (/credit balance/i.test(apiMessage)) {
+      return {
+        status,
+        code: 'no_credits',
+        message:
+          'Tu cuenta de Anthropic no tiene créditos para la API. Recarga en console.anthropic.com → Settings → Billing (la suscripción de Claude.ai no incluye uso de la API).',
+      } as { message: string; status?: number };
+    }
     const base = msg[status ?? 0] ?? `Error de la API de Claude (${status ?? 'sin estado'})`;
-    const detail = status === 400 ? `: ${err.message}` : '';
+    const detail = status === 400 && apiMessage ? `: ${apiMessage}` : '';
     return { message: base + detail, status };
   }
   if (err instanceof Anthropic.APIConnectionTimeoutError) return { message: 'Claude tardó demasiado en responder. Prueba con una pregunta más corta o con Haiku.' };
