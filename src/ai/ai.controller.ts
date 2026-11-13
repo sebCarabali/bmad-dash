@@ -5,6 +5,11 @@ import { AiContext, AiTask, BASE_INSTRUCTIONS, BUDGETS, QUICK_TASK_MAX_TOKENS, p
 import { GroqError, groqModels, groqStream } from './groq.client';
 
 type Provider = 'groq' | 'claude';
+
+/** Key de Groq del servidor (Vercel → Environment Variables → GROQ_KEY). */
+export function groqServerKey(): string {
+  return (process.env.GROQ_KEY ?? process.env.GROQ_API_KEY ?? '').trim();
+}
 const CLAUDE_MODELS = ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5'];
 const TASKS: AiTask[] = ['chat', 'draft-story', 'review-story'];
 /** Groq gratis tiene poco cupo por minuto: respuestas más cortas e historial recortado. */
@@ -24,8 +29,9 @@ interface ChatBody {
  */
 @Controller('ai')
 export class AiController {
+  /** Key del usuario (cabecera) o, para Groq, la del servidor (variable de entorno GROQ_KEY). */
   private key(raw?: string, provider: Provider = 'groq') {
-    const k = (raw ?? '').trim();
+    const k = (raw ?? '').trim() || (provider === 'groq' ? groqServerKey() : '');
     if (!k) throw new UnauthorizedException(`Configura tu API key de ${provider === 'groq' ? 'Groq' : 'Anthropic'} en el asistente.`);
     return k;
   }
@@ -37,7 +43,7 @@ export class AiController {
     const provider: Provider = body?.provider === 'claude' ? 'claude' : 'groq';
     const key = this.key(aiKey || legacyKey, provider);
     try {
-      if (provider === 'groq') return { ok: true, models: await groqModels(key) };
+      if (provider === 'groq') return { ok: true, models: await groqModels(key), serverKey: !(aiKey || legacyKey) };
       await new Anthropic({ apiKey: key, maxRetries: 1, timeout: 20_000 }).models.list({ limit: 1 });
       return { ok: true, models: CLAUDE_MODELS };
     } catch (err) {

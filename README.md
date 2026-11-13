@@ -41,6 +41,9 @@ y el servidor la reenvía al proveedor en cada petición sin almacenarla ni regi
 - **✨ Redactar con IA** y **✨ Revisar con IA** en Nueva historia.
 - Errores claros: key inválida, sin créditos (Claude), límite por minuto/día o petición demasiado grande (Groq).
 
+**Key de Groq del servidor:** si defines la variable de entorno `GROQ_KEY` (en Vercel: Settings → Environment Variables),
+el asistente funciona sin pedir key a los usuarios; el valor nunca se envía al navegador. Quien prefiera, puede seguir usando su propia key.
+
 Endpoints: `POST /api/ai/validate` (devuelve los modelos disponibles) y `POST /api/ai/chat` (stream NDJSON), con `provider` en el cuerpo y la key en la cabecera `x-ai-key`.
 
 ## Vistas
