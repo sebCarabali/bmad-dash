@@ -1,12 +1,17 @@
 import { BadRequestException, Body, Controller, Headers, HttpCode, Post, Res, UnauthorizedException } from '@nestjs/common';
 import type { Response } from 'express';
 import Anthropic from '@anthropic-ai/sdk';
-import { AiContext, AiTask, BASE_INSTRUCTIONS, QUICK_TASK_MAX_TOKENS, projectContext, taskInstructions } from './ai.prompts';
+import { AiContext, AiTask, BASE_INSTRUCTIONS, BUDGETS, QUICK_TASK_MAX_TOKENS, projectContext, taskInstructions } from './ai.prompts';
+import { GroqError, groqModels, groqStream } from './groq.client';
 
-const MODELS = ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5'];
+type Provider = 'groq' | 'claude';
+const CLAUDE_MODELS = ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5'];
 const TASKS: AiTask[] = ['chat', 'draft-story', 'review-story'];
+/** Groq gratis tiene poco cupo por minuto: respuestas más cortas e historial recortado. */
+const GROQ_MAX_TOKENS: Record<AiTask, number> = { chat: 1500, 'draft-story': 2200, 'review-story': 1200 };
 
 interface ChatBody {
+  provider?: Provider;
   task?: AiTask;
   model?: string;
   messages?: { role: 'user' | 'assistant'; content: string }[];
@@ -14,53 +19,60 @@ interface ChatBody {
 }
 
 /**
- * Proxy hacia la API de Claude con la API key de cada usuario (cabecera x-anthropic-key).
+ * Proxy hacia Groq o Claude con la API key de cada usuario (cabecera x-ai-key).
  * La key no se guarda ni se registra en el servidor.
  */
 @Controller('ai')
 export class AiController {
-  private client(key?: string) {
-    const apiKey = (key ?? '').trim();
-    if (!apiKey) throw new UnauthorizedException('Configura tu API key de Anthropic en el asistente.');
-    return new Anthropic({ apiKey, maxRetries: 1, timeout: 55_000 });
+  private key(raw?: string, provider: Provider = 'groq') {
+    const k = (raw ?? '').trim();
+    if (!k) throw new UnauthorizedException(`Configura tu API key de ${provider === 'groq' ? 'Groq' : 'Anthropic'} en el asistente.`);
+    return k;
   }
 
-  /** Comprueba que la key es válida sin consumir tokens. */
+  /** Verifica la key y devuelve los modelos disponibles. */
   @Post('validate')
   @HttpCode(200)
-  async validate(@Headers('x-anthropic-key') key: string) {
+  async validate(@Headers('x-ai-key') aiKey: string, @Headers('x-anthropic-key') legacyKey: string, @Body() body: { provider?: Provider }) {
+    const provider: Provider = body?.provider === 'claude' ? 'claude' : 'groq';
+    const key = this.key(aiKey || legacyKey, provider);
     try {
-      await this.client(key).models.list({ limit: 1 });
-      return { ok: true };
+      if (provider === 'groq') return { ok: true, models: await groqModels(key) };
+      await new Anthropic({ apiKey: key, maxRetries: 1, timeout: 20_000 }).models.list({ limit: 1 });
+      return { ok: true, models: CLAUDE_MODELS };
     } catch (err) {
-      const e = friendlyError(err);
-      throw new BadRequestException(e.message);
+      throw new BadRequestException(friendlyError(err).message);
     }
   }
 
   /** Respuesta en streaming como NDJSON: {type:'text'|'done'|'error', ...} por línea. */
   @Post('chat')
-  async chat(@Headers('x-anthropic-key') key: string, @Body() body: ChatBody, @Res() res: Response) {
+  async chat(@Headers('x-ai-key') aiKey: string, @Headers('x-anthropic-key') legacyKey: string, @Body() body: ChatBody, @Res() res: Response) {
+    const provider: Provider = body?.provider === 'claude' ? 'claude' : 'groq';
     const task: AiTask = TASKS.includes(body?.task as AiTask) ? (body.task as AiTask) : 'chat';
-    const model = MODELS.includes(body?.model ?? '') ? body.model : MODELS[0];
     const ctx = body?.context ?? {};
+    const budget = BUDGETS[provider];
+    const historyLimit = provider === 'groq' ? 6 : 20;
+    const msgChars = provider === 'groq' ? 3_000 : 20_000;
+
     let messages = (body?.messages ?? [])
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
-      .slice(-20)
-      .map((m) => ({ role: m.role, content: m.content.slice(0, 20_000) }));
+      .slice(-historyLimit)
+      .map((m) => ({ role: m.role, content: m.content.slice(0, msgChars) }));
     if (task === 'draft-story') messages = [{ role: 'user', content: 'Redacta la especificación de la historia según las instrucciones.' }];
     if (task === 'review-story') messages = [{ role: 'user', content: 'Revisa el borrador de la historia según las instrucciones.' }];
-    if (!messages.length || messages[messages.length - 1].role !== 'user') throw new BadRequestException('Falta el mensaje del usuario.');
     while (messages.length && messages[0].role !== 'user') messages.shift();
+    if (!messages.length || messages[messages.length - 1].role !== 'user') throw new BadRequestException('Falta el mensaje del usuario.');
 
-    const client = this.client(key);
-    const extra = taskInstructions(task, ctx);
-    const system: Anthropic.TextBlockParam[] = [
-      { type: 'text', text: BASE_INSTRUCTIONS },
-      // Bloque grande y estable: se cachea entre turnos del chat (prompt caching)
-      { type: 'text', text: projectContext(ctx), cache_control: { type: 'ephemeral' } },
-    ];
-    if (extra) system.push({ type: 'text', text: extra });
+    const key = this.key(aiKey || legacyKey, provider);
+    let context = projectContext(ctx, budget);
+    const extra = taskInstructions(task, ctx, budget);
+    // Groq gratis: ~8K tokens por minuto entre entrada y salida. Tope de ~5K tokens para el contexto.
+    if (provider === 'groq') {
+      const MAX = 20_000;
+      if (context.length + extra.length > MAX && ctx.docs?.length) context = projectContext({ ...ctx, docs: [] }, budget) + '\n\n(Documentos de planificación omitidos para no superar el límite del plan gratuito.)';
+      if (context.length + extra.length > MAX) context = context.slice(0, Math.max(4_000, MAX - extra.length)) + '\n…[contexto recortado]';
+    }
 
     res.status(200);
     res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
@@ -68,40 +80,70 @@ export class AiController {
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
     const send = (obj: unknown) => res.write(JSON.stringify(obj) + '\n');
+    const abort = new AbortController();
+    let closed = false;
+    res.on('close', () => {
+      closed = true;
+      if (!res.writableEnded) abort.abort();
+    });
 
-    let aborted = false;
-    res.on('close', () => (aborted = true));
     try {
-      const stream = client.messages.stream({ model, max_tokens: QUICK_TASK_MAX_TOKENS[task], system, messages });
-      res.on('close', () => {
-        if (!res.writableEnded) stream.abort();
-      });
-      stream.on('text', (delta) => {
-        if (!aborted) send({ type: 'text', text: delta });
-      });
-      const final = await stream.finalMessage();
-      send({
-        type: 'done',
-        model: final.model,
-        stopReason: final.stop_reason,
-        usage: {
-          input: final.usage.input_tokens,
-          output: final.usage.output_tokens,
-          cacheRead: final.usage.cache_read_input_tokens ?? 0,
-          cacheWrite: final.usage.cache_creation_input_tokens ?? 0,
-        },
-      });
+      if (provider === 'groq') {
+        const r = await groqStream({
+          key,
+          model: body?.model || 'openai/gpt-oss-120b',
+          system: [BASE_INSTRUCTIONS, context, extra].filter(Boolean).join('\n\n'),
+          messages,
+          maxTokens: GROQ_MAX_TOKENS[task],
+          onText: (t) => !closed && send({ type: 'text', text: t }),
+          signal: abort.signal,
+        });
+        send({ type: 'done', provider, model: r.model, stopReason: r.stopReason, usage: r.usage });
+      } else {
+        const client = new Anthropic({ apiKey: key, maxRetries: 1, timeout: 55_000 });
+        const system: Anthropic.TextBlockParam[] = [
+          { type: 'text', text: BASE_INSTRUCTIONS },
+          // Bloque grande y estable: se cachea entre turnos del chat (prompt caching)
+          { type: 'text', text: context, cache_control: { type: 'ephemeral' } },
+        ];
+        if (extra) system.push({ type: 'text', text: extra });
+        const model = CLAUDE_MODELS.includes(body?.model ?? '') ? body.model : CLAUDE_MODELS[0];
+        const stream = client.messages.stream({ model, max_tokens: QUICK_TASK_MAX_TOKENS[task], system, messages }, { signal: abort.signal });
+        stream.on('text', (delta) => !closed && send({ type: 'text', text: delta }));
+        const final = await stream.finalMessage();
+        send({
+          type: 'done',
+          provider,
+          model: final.model,
+          stopReason: final.stop_reason,
+          usage: {
+            input: final.usage.input_tokens,
+            output: final.usage.output_tokens,
+            cacheRead: final.usage.cache_read_input_tokens ?? 0,
+            cacheWrite: final.usage.cache_creation_input_tokens ?? 0,
+          },
+        });
+      }
     } catch (err) {
-      if (!aborted) send({ type: 'error', ...friendlyError(err) });
+      if (!closed) send({ type: 'error', ...friendlyError(err) });
     } finally {
       res.end();
     }
   }
 }
 
-function friendlyError(err: unknown): { message: string; status?: number } {
+function friendlyError(err: unknown): { message: string; status?: number; retryAfter?: number; code?: string } {
+  if (err instanceof GroqError) return { message: err.message, status: err.status, retryAfter: err.retryAfter };
   if (err instanceof Anthropic.APIError) {
     const status = err.status;
+    const apiMessage: string = (err as any).error?.error?.message ?? (err as any).error?.message ?? err.message ?? '';
+    if (/credit balance/i.test(apiMessage)) {
+      return {
+        status,
+        code: 'no_credits',
+        message: 'Tu cuenta de Anthropic no tiene créditos para la API. Recarga en console.anthropic.com → Settings → Billing, o usa Groq (gratis).',
+      };
+    }
     const msg: Record<number, string> = {
       400: 'Petición rechazada por la API de Claude',
       401: 'API key de Anthropic inválida o revocada.',
@@ -111,19 +153,8 @@ function friendlyError(err: unknown): { message: string; status?: number } {
       429: 'Límite de uso alcanzado en tu cuenta de Anthropic. Espera un momento.',
       529: 'Claude está saturado en este momento. Reintenta en unos segundos.',
     };
-    // Mensaje real de la API (sin el JSON crudo): { type: 'error', error: { type, message } }
-    const apiMessage: string = (err as any).error?.error?.message ?? (err as any).error?.message ?? err.message ?? '';
-    if (/credit balance/i.test(apiMessage)) {
-      return {
-        status,
-        code: 'no_credits',
-        message:
-          'Tu cuenta de Anthropic no tiene créditos para la API. Recarga en console.anthropic.com → Settings → Billing (la suscripción de Claude.ai no incluye uso de la API).',
-      } as { message: string; status?: number };
-    }
     const base = msg[status ?? 0] ?? `Error de la API de Claude (${status ?? 'sin estado'})`;
-    const detail = status === 400 && apiMessage ? `: ${apiMessage}` : '';
-    return { message: base + detail, status };
+    return { message: base + (status === 400 && apiMessage ? `: ${apiMessage}` : ''), status };
   }
   if (err instanceof Anthropic.APIConnectionTimeoutError) return { message: 'Claude tardó demasiado en responder. Prueba con una pregunta más corta o con Haiku.' };
   if (err instanceof Anthropic.APIConnectionError) return { message: 'No se pudo conectar con la API de Claude.' };

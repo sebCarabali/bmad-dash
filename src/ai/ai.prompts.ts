@@ -14,9 +14,20 @@ export interface AiContext {
 
 export type AiTask = 'chat' | 'draft-story' | 'review-story';
 
-const MAX_DOC_CHARS = 60_000;
-const MAX_DOCS = 6;
-const MAX_STORY_CHARS = 40_000;
+/** Cuánto contexto cabe según el proveedor (Groq gratis: ~8K tokens por minuto). */
+export interface ContextBudget {
+  docChars: number;
+  maxDocs: number;
+  storyChars: number;
+  maxStories: number;
+  epicDescChars: number;
+  maxSuggestions: number;
+  maxAlerts: number;
+}
+export const BUDGETS: Record<'claude' | 'groq', ContextBudget> = {
+  claude: { docChars: 60_000, maxDocs: 6, storyChars: 40_000, maxStories: 400, epicDescChars: 300, maxSuggestions: 15, maxAlerts: 40 },
+  groq: { docChars: 3_500, maxDocs: 3, storyChars: 6_000, maxStories: 120, epicDescChars: 120, maxSuggestions: 6, maxAlerts: 12 },
+};
 
 export const BASE_INSTRUCTIONS = `Eres el asistente de un dashboard de proyectos que usan BMAD Method (Breakthrough Method for Agile AI-Driven Development).
 Actúas como un Scrum Master / Product Owner experto en BMAD: conoces el ciclo sprint-planning → create-story → story-context/story-ready → dev-story → code-review → story-done → retrospective, y correct-course para cambios de alcance.
@@ -35,7 +46,7 @@ function trunc(s: string, max: number) {
 }
 
 /** Contexto estable del proyecto (se cachea con prompt caching entre turnos del chat). */
-export function projectContext(ctx: AiContext): string {
+export function projectContext(ctx: AiContext, b: ContextBudget = BUDGETS.claude): string {
   const p = ctx.project ?? {};
   const lines: string[] = [];
   lines.push(`# Proyecto: ${p.name ?? 'sin nombre'} (${p.version ?? 'BMAD'})`);
@@ -46,11 +57,11 @@ export function projectContext(ctx: AiContext): string {
   if (ctx.epics?.length) {
     lines.push('\n## Épicas');
     for (const e of ctx.epics.slice(0, 60))
-      lines.push(`- Épica ${e.number}: ${e.title} — ${e.status}, ${e.progress}% hecho${e.description ? ` — ${trunc(e.description.replace(/\s+/g, ' '), 300)}` : ''}`);
+      lines.push(`- Épica ${e.number}: ${e.title} — ${e.status}, ${e.progress}% hecho${e.description ? ` — ${trunc(e.description.replace(/\s+/g, ' '), b.epicDescChars)}` : ''}`);
   }
   if (ctx.stories?.length) {
     lines.push('\n## Historias (id · título · estado · tareas)');
-    for (const s of ctx.stories.slice(0, 400)) {
+    for (const s of ctx.stories.slice(0, b.maxStories)) {
       const tasks = s.tasksTotal ? ` · tareas ${s.tasksDone}/${s.tasksTotal}` : '';
       const warn = s.warnings?.length ? ` · ⚠ ${s.warnings.join('; ')}` : '';
       lines.push(`- ${s.id} · ${s.title} · ${s.status}${tasks}${s.relativePath ? ` · ${s.relativePath}` : ''}${warn}`);
@@ -58,23 +69,23 @@ export function projectContext(ctx: AiContext): string {
   }
   if (ctx.suggestions?.length) {
     lines.push(`\n## Comandos sugeridos por el dashboard (formato elegido: ${p.commandStyle ?? 'v6'})`);
-    for (const s of ctx.suggestions.slice(0, 15)) lines.push(`- [${s.priority}] ${s.title}: ${s.steps.join(' → ')}${s.reason ? ` — ${s.reason}` : ''}`);
+    for (const s of ctx.suggestions.slice(0, b.maxSuggestions)) lines.push(`- [${s.priority}] ${s.title}: ${s.steps.join(' → ')}${s.reason ? ` — ${s.reason}` : ''}`);
   }
   if (ctx.alerts?.length) {
     lines.push('\n## Alertas');
-    for (const a of ctx.alerts.slice(0, 40)) lines.push(`- ${a}`);
+    for (const a of ctx.alerts.slice(0, b.maxAlerts)) lines.push(`- ${a}`);
   }
-  for (const d of (ctx.docs ?? []).slice(0, MAX_DOCS)) {
-    lines.push(`\n## Documento: ${d.path}\n<documento ruta="${d.path}">\n${trunc(d.content, MAX_DOC_CHARS)}\n</documento>`);
+  for (const d of (ctx.docs ?? []).slice(0, b.maxDocs)) {
+    lines.push(`\n## Documento: ${d.path}\n<documento ruta="${d.path}">\n${trunc(d.content, b.docChars)}\n</documento>`);
   }
   return lines.join('\n');
 }
 
 /** Instrucciones del turno según la tarea (van después del bloque cacheado). */
-export function taskInstructions(task: AiTask, ctx: AiContext): string {
+export function taskInstructions(task: AiTask, ctx: AiContext, b: ContextBudget = BUDGETS.claude): string {
   const parts: string[] = [];
   if (ctx.focusStory?.markdown) {
-    parts.push(`## Historia en foco: ${ctx.focusStory.id}\n<historia>\n${trunc(ctx.focusStory.markdown, MAX_STORY_CHARS)}\n</historia>`);
+    parts.push(`## Historia en foco: ${ctx.focusStory.id}\n<historia>\n${trunc(ctx.focusStory.markdown, b.storyChars)}\n</historia>`);
   }
   if (task === 'draft-story') {
     parts.push(`## Tarea: redactar una especificación de historia BMAD
@@ -97,7 +108,7 @@ respeta el alcance de la historia planificada; usa el idioma de los datos del fo
   } else if (task === 'review-story') {
     parts.push(`## Tarea: revisar una especificación de historia antes de pasarla a desarrollo
 <borrador>
-${trunc(ctx.specMarkdown ?? '', MAX_STORY_CHARS)}
+${trunc(ctx.specMarkdown ?? '', b.storyChars)}
 </borrador>
 Evalúa como un PO exigente: claridad de la user story, criterios verificables y completos, cobertura AC↔tareas, tamaño (¿cabe en una sesión de dev-story?),
 coherencia con la épica/PRD/arquitectura del contexto, riesgos y dependencias con otras historias.

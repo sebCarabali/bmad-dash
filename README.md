@@ -26,19 +26,22 @@ El dashboard se actualiza solo cuando cambian las historias (activado por defect
 Al detectar cambios muestra un aviso (p. ej. `1.3: En progreso → En revisión`), resalta las historias afectadas,
 añade la entrada al panel **Cambios detectados**, recalcula los comandos sugeridos y sincroniza el snapshot.
 
-## Asistente con Claude
+## Asistente con IA (Groq gratis o Claude)
 
-Pestaña **✨ Asistente** y botones ✨ en el dashboard, usando la API de Claude con **la API key de cada usuario**
-(se guarda solo en su navegador; el servidor la reenvía a Anthropic en cada petición sin almacenarla ni registrarla).
+Pestaña **✨ Asistente** y botones ✨ en el dashboard. Cada usuario usa **su propia API key**: se guarda solo en su navegador
+y el servidor la reenvía al proveedor en cada petición sin almacenarla ni registrarla.
 
-- **Chat sobre el proyecto**: Claude recibe el estado de épicas e historias, alertas y comandos sugeridos (en el formato elegido)
-  y, opcionalmente, el PRD, la arquitectura, UX y épicas. El contexto del proyecto se cachea entre turnos (prompt caching).
-- **Preguntar sobre una historia**: desde el detalle de una historia, con su markdown completo en contexto.
-- **✨ Redactar con Claude** (Nueva historia): completa título, user story, criterios verificables, tareas con `(AC: n)`, Dev Notes y referencias.
-- **✨ Revisar con Claude**: revisión tipo PO del borrador (veredicto, problemas, sugerencias).
-- Modelos: Claude Sonnet 5.5 (por defecto), Opus 5.5 y Haiku 5.5.
+| Proveedor | Coste | Modelos | Notas |
+|---|---|---|---|
+| **Groq** (por defecto) | Plan gratuito sin tarjeta | Los de tu cuenta (p. ej. `openai/gpt-oss-120b`, `openai/gpt-oss-20b`) | Límites por minuto/día. El contexto se compacta (~5K tokens máx.) y los documentos se envían como extracto. Key en console.groq.com/keys |
+| **Claude** | Créditos prepagados de la API de Anthropic | Sonnet 5.5, Opus 5.5, Haiku 5.5 | Contexto completo con prompt caching. Key en console.anthropic.com/settings/keys |
 
-Endpoints: `POST /api/ai/validate` y `POST /api/ai/chat` (stream NDJSON), ambos con la cabecera `x-anthropic-key`.
+- **Chat sobre el proyecto**: conoce épicas, historias, alertas y comandos sugeridos (en el formato elegido); opcionalmente PRD, arquitectura, UX y épicas.
+- **Preguntar sobre una historia** desde su detalle, con su markdown en contexto.
+- **✨ Redactar con IA** y **✨ Revisar con IA** en Nueva historia.
+- Errores claros: key inválida, sin créditos (Claude), límite por minuto/día o petición demasiado grande (Groq).
+
+Endpoints: `POST /api/ai/validate` (devuelve los modelos disponibles) y `POST /api/ai/chat` (stream NDJSON), con `provider` en el cuerpo y la key en la cabecera `x-ai-key`.
 
 ## Vistas
 
