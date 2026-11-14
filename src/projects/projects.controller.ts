@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, Get, Headers, HttpCode, InternalServerErrorException, NotFoundException, Param, ParseUUIDPipe, Post } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, Headers, HttpCode, InternalServerErrorException, NotFoundException, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { SupabaseService } from '../supabase/supabase.service';
 
@@ -124,6 +124,53 @@ export class ProjectsController {
       .eq('project_id', id)
       .order('occurred_at', { ascending: true })
       .limit(5000);
+    if (error) throw new InternalServerErrorException(error.message);
+    return data ?? [];
+  }
+
+  /** Registra el consumo de tokens de una petición al asistente. */
+  @Post(':id/ai-usage')
+  async addUsage(
+    @Headers('authorization') auth: string,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() b: { task: string; provider: string; model?: string; usage?: any; docsMode?: string; docSections?: number; conversationId?: string | null },
+  ) {
+    const { client, user } = await this.supabase.user(auth);
+    if (!['chat', 'draft-story', 'review-story'].includes(b?.task) || !['groq', 'claude'].includes(b?.provider)) throw new BadRequestException('Datos de uso no válidos.');
+    const n = (v: unknown) => Math.max(0, Math.min(10_000_000, Math.round(Number(v) || 0)));
+    const uuidRe = /^[0-9a-f-]{36}$/i;
+    const { error } = await client.from('ai_usage').insert({
+      project_id: id,
+      owner_id: user.id,
+      conversation_id: b.conversationId && uuidRe.test(b.conversationId) ? b.conversationId : null,
+      task: b.task,
+      provider: b.provider,
+      model: b.model ? String(b.model).slice(0, 100) : null,
+      input_tokens: n(b.usage?.input),
+      output_tokens: n(b.usage?.output),
+      cache_read_tokens: n(b.usage?.cacheRead),
+      cache_write_tokens: n(b.usage?.cacheWrite),
+      docs_mode: b.docsMode ? String(b.docsMode).slice(0, 20) : null,
+      doc_sections: n(b.docSections),
+      stop_reason: b.usage?.stopReason ? String(b.usage.stopReason).slice(0, 40) : null,
+    });
+    if (error) throw new InternalServerErrorException(error.message);
+    return { ok: true };
+  }
+
+  /** Consumo de tokens del asistente en los últimos N días (máx. 180). */
+  @Get(':id/ai-usage')
+  async usage(@Headers('authorization') auth: string, @Param('id', ParseUUIDPipe) id: string, @Query('days') days?: string) {
+    const { client } = await this.supabase.user(auth);
+    const d = Math.min(180, Math.max(1, Number(days) || 30));
+    const since = new Date(Date.now() - d * 86_400_000).toISOString();
+    const { data, error } = await client
+      .from('ai_usage')
+      .select('task, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, docs_mode, doc_sections, stop_reason, created_at')
+      .eq('project_id', id)
+      .gte('created_at', since)
+      .order('created_at', { ascending: true })
+      .limit(10000);
     if (error) throw new InternalServerErrorException(error.message);
     return data ?? [];
   }

@@ -1276,6 +1276,7 @@
         const { ctx: context, sources } = await buildAiContext({ task: 'draft-story', specDraft });
         status.textContent = sources.length ? `Usando: ${sources.join(' · ')}` : 'Redactando…';
         const r = await aiStream({ task: 'draft-story', context, onText: (full) => { status.textContent = `Redactando… ${full.length} caracteres`; } });
+        logAiUsage({ task: 'draft-story', usage: { ...(r.usage || {}), model: r.model, stopReason: r.stopReason }, sections: context.sections?.length || 0 });
         const out = extractJson(r.text);
         if (out.title) F('title').value = out.title;
         if (out.role) F('role').value = out.role;
@@ -1301,6 +1302,7 @@
       try {
         const { ctx: context, sources } = await buildAiContext({ task: 'review-story', specMarkdown: lastPreview.markdown });
         const r = await aiStream({ task: 'review-story', context, onText: (full) => { box.innerHTML = renderMd(full); } });
+        logAiUsage({ task: 'review-story', usage: { ...(r.usage || {}), model: r.model, stopReason: r.stopReason }, sections: context.sections?.length || 0 });
         box.innerHTML = renderMd(r.text) + `<p class="muted small-text">${esc(usageLine(r.usage))}</p>${sourcesHtml(sources)}`;
       } catch (err) { box.innerHTML = `<p class="hint err">${esc(err.message)}</p>`; }
       finally { btn.disabled = false; }
@@ -2066,7 +2068,7 @@
         reply.at = Date.now();
         delete reply.streaming;
         $('#ai-usage').textContent = usageLine(r.usage) + (r.stopReason === 'max_tokens' ? ' · respuesta recortada por longitud' : '');
-        persistConversation();
+        persistConversation().then(() => logAiUsage({ task: 'chat', usage: reply.usage, sections: context.sections?.length || 0, conversationId: ai.conversationId }));
       } catch (err) {
         if (err.name === 'AbortError') {
           reply.content = (reply.content || '') + '\n\n_(detenido)_';
@@ -2296,15 +2298,126 @@
     </svg>`;
   }
 
+  // ---------------- Uso del asistente (tokens) ----------------
+  /** Precios de lista por millón de tokens (USD) para estimar coste. Groq plan Free = 0. Caché: lectura 0,1×, escritura 1,25× la entrada. */
+  const AI_PRICES = { 'claude-sonnet-5-5': { in: 2, out: 10 }, 'claude-opus-5-5': { in: 4, out: 20 } };
+  function usageCost(r) {
+    if (r.provider === 'groq') return 0;
+    const p = AI_PRICES[r.model];
+    if (!p) return null;
+    return (r.input_tokens * p.in + r.cache_read_tokens * p.in * 0.1 + r.cache_write_tokens * p.in * 1.25 + r.output_tokens * p.out) / 1e6;
+  }
+  async function logAiUsage({ task, usage, sections = 0, conversationId = null }) {
+    if (!usage || !state.session || !state.cloudProjectId) return;
+    try {
+      await post(`/api/projects/${state.cloudProjectId}/ai-usage`, { task, provider: aiProvider(), model: usage.model || aiModel(), usage, docsMode: docsMode(), docSections: sections, conversationId });
+    } catch { /* el registro de uso nunca bloquea al asistente */ }
+  }
+
+  function computeUsage(rows, days) {
+    const tot = { n: rows.length, input: 0, output: 0, cacheRead: 0, cost: 0, costUnknown: 0, maxed: 0 };
+    const byTask = {}, byModel = {}, docs = { with: [], without: [] };
+    const dayStart = (t) => { const d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime(); };
+    const today = dayStart(Date.now());
+    const daily = Array.from({ length: days }, (_, i) => ({ day: today - (days - 1 - i) * DAY, input: 0, output: 0, n: 0 }));
+    for (const r of rows) {
+      const inp = r.input_tokens + r.cache_read_tokens + r.cache_write_tokens;
+      tot.input += inp; tot.output += r.output_tokens; tot.cacheRead += r.cache_read_tokens;
+      const c = usageCost(r);
+      if (c === null) tot.costUnknown++; else tot.cost += c;
+      if (r.stop_reason === 'max_tokens' || r.stop_reason === 'length') tot.maxed++;
+      const t = (byTask[r.task] ||= { n: 0, input: 0, output: 0 }); t.n++; t.input += inp; t.output += r.output_tokens;
+      const mk = `${r.provider}|${r.model || '—'}`;
+      const m = (byModel[mk] ||= { provider: r.provider, model: r.model || '—', n: 0, input: 0, output: 0, cost: 0, costKnown: true }); m.n++; m.input += inp; m.output += r.output_tokens;
+      if (c === null) m.costKnown = false; else m.cost += c;
+      if (r.task === 'chat') (r.doc_sections > 0 ? docs.with : docs.without).push(inp);
+      const dIdx = daily.findIndex((x) => x.day === dayStart(Date.parse(r.created_at)));
+      if (dIdx >= 0) { daily[dIdx].input += inp; daily[dIdx].output += r.output_tokens; daily[dIdx].n++; }
+    }
+    const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+    return { tot, byTask, byModel: Object.values(byModel).sort((a, b) => b.input + b.output - a.input - a.output), daily, docsWith: avg(docs.with), docsWithout: avg(docs.without), nWith: docs.with.length, nWithout: docs.without.length };
+  }
+
+  const fmtTok = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(2)} M` : n >= 1e4 ? `${(n / 1e3).toFixed(1)} k` : Math.round(n).toLocaleString());
+  const fmtUsd = (v) => (v < 0.01 && v > 0 ? '< $0.01' : `$${v.toFixed(2)}`);
+
+  /** Barras apiladas por día: entrada (incl. caché) y salida. */
+  function dailyTokensChart(daily) {
+    const W = 640, H = 200, L = 46, B = 26, T = 14;
+    const max = Math.max(1, ...daily.map((d) => d.input + d.output));
+    const bw = (W - L) / daily.length;
+    const y = (v) => T + (1 - v / max) * (H - T - B);
+    const fmt = (t) => new Date(t).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+    const every = Math.ceil(daily.length / 8);
+    const bars = daily.map((d, i) => {
+      const x = L + i * bw + bw * 0.15, w = Math.max(2, bw * 0.7);
+      const yIn = y(d.input), yTop = y(d.input + d.output);
+      const inH = H - B - yIn, outH = yIn - yTop;
+      return `<g><title>${fmt(d.day)}: ${d.n} petición(es) · entrada ${fmtTok(d.input)} · salida ${fmtTok(d.output)}</title>
+        ${inH > 0 ? `<rect x="${x}" y="${yIn}" width="${w}" height="${inH}" fill="var(--c-total)"/>` : ''}
+        ${outH > 2 ? `<rect x="${x}" y="${yTop}" width="${w}" height="${outH - 2}" rx="2" fill="var(--c-done)"/>` : ''}
+        ${i % every === 0 ? `<text class="axis-label" x="${x + w / 2}" y="${H - 8}" text-anchor="middle">${fmt(d.day)}</text>` : ''}
+        <rect x="${L + i * bw}" y="${T}" width="${bw}" height="${H - T - B}" fill="transparent"/></g>`;
+    }).join('');
+    return `<div class="legend" style="margin:0 0 6px"><span><i class="swatch" style="background:var(--c-total)"></i>Entrada (incl. caché)</span><span><i class="swatch" style="background:var(--c-done)"></i>Salida</span></div>
+      <svg viewBox="0 0 ${W} ${H}" class="tp-chart" style="max-width:720px" role="img" aria-label="Tokens del asistente por día">
+        ${[0, max / 2, max].map((t) => `<line class="grid-line" x1="${L}" x2="${W}" y1="${y(t)}" y2="${y(t)}"/><text class="axis-label" x="${L - 6}" y="${y(t) + 4}" text-anchor="end">${fmtTok(t)}</text>`).join('')}
+        ${bars}
+      </svg>`;
+  }
+
+  async function usageSectionHtml() {
+    const days = store.get('bmad.usageDays', 30);
+    const rows = await api(`/api/projects/${state.cloudProjectId}/ai-usage?days=${days}`);
+    const u = computeUsage(rows, days);
+    const TASK = { chat: 'Chat', 'draft-story': 'Redactar historia', 'review-story': 'Revisar historia' };
+    const PROV = { groq: 'Groq', claude: 'Claude' };
+    const cachePct = u.tot.input ? Math.round((u.tot.cacheRead / u.tot.input) * 100) : 0;
+    const head = `<div class="panel-head" style="margin-top:26px"><h2>Uso del asistente</h2><span class="muted">tokens por petición registrados</span><span class="spacer"></span>
+      <label class="field-inline small-text">Periodo <select id="usage-days">${[7, 30, 90].map((n) => `<option value="${n}" ${n === days ? 'selected' : ''}>Últimos ${n} días</option>`).join('')}</select></label></div>`;
+    if (!rows.length) return head + `<div class="panel empty">Sin peticiones al asistente en los últimos ${days} días. Se registran el chat, "Redactar con IA" y "Revisar con IA" con la sesión iniciada.</div>`;
+    return head + `
+      <div class="grid kpis">
+        ${kpi('Tokens totales', fmtTok(u.tot.input + u.tot.output), `${fmtTok(u.tot.input)} entrada · ${fmtTok(u.tot.output)} salida`)}
+        ${kpi('Peticiones', u.tot.n, u.tot.maxed ? `${u.tot.maxed} recortada(s) por longitud` : 'ninguna recortada')}
+        ${kpi('Media por petición', fmtTok((u.tot.input + u.tot.output) / u.tot.n), `${fmtTok(u.tot.input / u.tot.n)} de entrada`)}
+        ${kpi('Desde caché', `${cachePct}%`, 'de la entrada (más barato / no cuenta en límites)')}
+        ${kpi('Coste estimado', fmtUsd(u.tot.cost), u.tot.costUnknown ? `${u.tot.costUnknown} petición(es) sin precio conocido` : 'Groq Free = $0 · Claude a precio de lista')}
+      </div>
+      <div class="panel" style="margin-top:16px"><div class="panel-head"><h2>Tokens por día</h2></div>${dailyTokensChart(u.daily)}</div>
+      <div class="grid two" style="margin-top:16px">
+        <div class="panel">
+          <div class="panel-head"><h2>Por tarea</h2></div>
+          <table class="trend-table"><tr><th>Tarea</th><th>Peticiones</th><th>Entrada media</th><th>Salida media</th><th>Total</th></tr>
+          ${Object.entries(u.byTask).map(([k, v]) => `<tr><td>${TASK[k] || k}</td><td>${v.n}</td><td>${fmtTok(v.input / v.n)}</td><td>${fmtTok(v.output / v.n)}</td><td>${fmtTok(v.input + v.output)}</td></tr>`).join('')}</table>
+          <div class="panel-head" style="margin-top:16px"><h2>Efecto de los documentos (chat)</h2></div>
+          <table class="trend-table"><tr><th>Consulta</th><th>Peticiones</th><th>Entrada media</th></tr>
+            <tr><td>Sin documentos (solo estado del sprint)</td><td>${u.nWithout}</td><td>${u.docsWithout == null ? '—' : fmtTok(u.docsWithout)}</td></tr>
+            <tr><td>Con secciones de PRD/arquitectura</td><td>${u.nWith}</td><td>${u.docsWith == null ? '—' : fmtTok(u.docsWith)}</td></tr></table>
+          <p class="tip">Muestra cuánto añade la documentación al contexto. Ajusta el modo "Docs" del asistente si la diferencia es grande.</p>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Por proveedor y modelo</h2></div>
+          <table class="trend-table"><tr><th>Modelo</th><th>Peticiones</th><th>Entrada</th><th>Salida</th><th>Coste est.</th></tr>
+          ${u.byModel.map((m) => `<tr><td>${PROV[m.provider] || m.provider} · <span class="mono">${esc(m.model)}</span></td><td>${m.n}</td><td>${fmtTok(m.input)}</td><td>${fmtTok(m.output)}</td><td>${m.provider === 'groq' ? '$0 (Free)' : m.costKnown ? fmtUsd(m.cost) : '—'}</td></tr>`).join('')}</table>
+          <p class="tip">Coste aproximado con precios de lista por millón de tokens: Sonnet 5.5 $2 / $10, Opus 5.5 $4 / $20 (entrada / salida); lectura de caché al 10% y escritura al 125% de la entrada. Verifica tu factura real en la consola de Anthropic.</p>
+        </div>
+      </div>`;
+  }
+
   async function renderMetrics(view, d) {
     const head = '<div class="panel-head"><h2>Métricas del sprint</h2><span class="muted">a partir de los cambios de estado registrados</span></div>';
     if (!state.sb) { view.innerHTML = head + '<div class="panel empty">Las métricas necesitan Supabase configurado en el servidor.</div>'; return; }
     if (!state.session) { view.innerHTML = head + '<div class="panel empty">Inicia sesión (pantalla de inicio → "Guarda tu historial en la nube") para registrar los cambios de estado y ver métricas.</div>'; return; }
     if (!state.cloudProjectId) { view.innerHTML = head + '<div class="panel empty">Sincronizando el proyecto con la nube…</div>'; setTimeout(() => currentTab() === 'metricas' && state.cloudProjectId && render(), 1500); return; }
     view.innerHTML = head + '<div class="loading">Calculando métricas…</div>';
-    let events;
-    try { events = await api(`/api/projects/${state.cloudProjectId}/events`); }
-    catch (err) { view.innerHTML = head + `<div class="panel empty">${esc(err.message)}</div>`; return; }
+    let events, usageHtml;
+    try {
+      [events, usageHtml] = await Promise.all([
+        api(`/api/projects/${state.cloudProjectId}/events`),
+        usageSectionHtml().catch((err) => `<div class="panel empty" style="margin-top:26px">Uso del asistente: ${esc(err.message)}</div>`),
+      ]);
+    } catch (err) { view.innerHTML = head + `<div class="panel empty">${esc(err.message)}</div>`; return; }
     if (currentTab() !== 'metricas') return;
     const m = computeMetrics(events, d.stories);
     const changes = events.filter((e) => e.kind === 'change').length;
@@ -2342,8 +2455,10 @@
           <div class="panel-head" style="margin-top:16px"><h2>Cycle time por historia</h2></div>
           ${m.cycles.length ? `<table class="trend-table"><tr><th>Historia</th><th>Cycle time</th><th>Terminada</th></tr>${m.cycles.slice(0, 15).map((c) => `<tr><td>${esc(c.id)} ${esc(c.title || '')}</td><td>${fmtDur(c.ms)}</td><td>${new Date(c.doneAt).toLocaleDateString()}</td></tr>`).join('')}</table>` : '<div class="empty">Aparecerá cuando una historia pase de in-progress a done mientras se mide.</div>'}
         </div>
-      </div>`;
+      </div>
+      ${usageHtml}`;
     bindCommon(view);
+    $('#usage-days')?.addEventListener('change', (e) => { store.set('bmad.usageDays', Number(e.target.value)); renderMetrics(view, d); });
   }
 
   // =====================================================================

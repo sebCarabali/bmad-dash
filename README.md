@@ -86,6 +86,11 @@ Al sincronizar (sesión iniciada) se registran los cambios de estado en `story_e
 muestra historias terminadas por semana, cycle time (in-progress → done), tiempo medio en cada estado, historias detenidas
 (más de 2 días en progreso o revisión) y una previsión de fecha por épica según el ritmo reciente.
 
+**Uso del asistente** (misma pestaña): cada petición (chat, redactar, revisar) se registra en `ai_usage` con tokens de entrada,
+salida y caché, proveedor, modelo y número de secciones de documentos enviadas. Se muestra para 7/30/90 días: tokens totales y por día,
+peticiones, media por petición, % desde caché, desglose por tarea y por modelo, efecto de los documentos en el chat y coste estimado
+(Groq Free = $0; Claude con precios de lista). El historial de uso no depende de las conversaciones: borrar un hilo no lo borra.
+
 ## Git y pruebas
 
 - **GitHub**: el repositorio se detecta desde `.git/config` (o se escribe a mano); token opcional de solo lectura para repos privados,
