@@ -32,7 +32,7 @@
     history: null,
     lastSync: null,
     busy: false,
-    ai: { convo: [], focus: null, prefill: '', streaming: null, index: null },
+    ai: { convo: [], focus: null, prefill: '', streaming: null, index: null, conversationId: null, title: null, saveState: null, saveChain: null },
   };
 
   const $ = (sel, el = document) => el.querySelector(sel);
@@ -73,7 +73,7 @@
   }
   async function api(url, opts = {}) {
     const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
-    if (url.startsWith('/api/projects')) { const t = await token(); if (t) headers.Authorization = `Bearer ${t}`; }
+    if (url.startsWith('/api/projects') || url.startsWith('/api/conversations')) { const t = await token(); if (t) headers.Authorization = `Bearer ${t}`; }
     const res = await fetch(url, { ...opts, headers });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw Object.assign(new Error(Array.isArray(body.message) ? body.message.join(' ') : body.message || `Error ${res.status}`), { status: res.status });
@@ -146,7 +146,9 @@
     }
     const load = async (rel, getFile, need) => {
       const old = prev?.get(rel);
-      if (!need && old) return old; // archivos no BMAD: basta con la metadata de la primera lectura
+      // .yaml no BMAD: basta con la metadata de la primera lectura. Los .md se revisan siempre (PRD, arquitectura…
+      // cambian el índice de secciones del asistente y los avisos de documentos modificados).
+      if (!need && old && !/\.md$/i.test(rel)) return old;
       const file = await getFile();
       const f = { path: rel, mtime: file.lastModified, size: file.size };
       if (need && file.size <= maxSize) {
@@ -172,7 +174,7 @@
         files.push(await load(c, () => fh.getFile(), true));
       } catch { /* no existe */ }
     }
-    const signature = files.filter((f) => f.content !== undefined).map((f) => `${f.path}|${f.mtime}|${f.size}`).sort().join('\n') + `#${files.length}`;
+    const signature = files.filter((f) => f.content !== undefined || /\.md$/i.test(f.path)).map((f) => `${f.path}|${f.mtime}|${f.size}`).sort().join('\n') + `#${files.length}`;
     return { files, markers, signature };
   }
 
@@ -1385,6 +1387,7 @@
     bindFixButtons(body, () => openStory(id));
     $('#ask-claude')?.addEventListener('click', () => {
       closeModal();
+      if (state.ai.convo.length && state.ai.focus !== id) addSystemNote(`Historia en foco: ${id}.`);
       state.ai.focus = id;
       state.ai.prefill = `Explícame el estado de la historia ${id} y qué falta para terminarla. ¿Cuál es el siguiente comando BMAD que debo ejecutar?`;
       if (location.hash === '#asistente') render(); else location.hash = 'asistente';
@@ -1642,7 +1645,7 @@
     const alwaysDocs = index.always;
     return {
       alwaysDocs,
-      sections: picked.map((s) => ({ source: s.source, content: s.text })),
+      sections: picked.map((s) => ({ source: s.source, content: s.text, path: s.path })),
       sources: [...alwaysDocs.map((d) => d.path.split('/').pop()), ...picked.map((s) => s.source)],
     };
   }
@@ -1769,6 +1772,198 @@
     });
   }
 
+  // =====================================================================
+  //  Conversaciones del asistente: guardado en Supabase y JSON
+  // =====================================================================
+  const CONV_FORMAT = 'bmad-dashboard.conversation';
+
+  /** Qué se envió como contexto en un turno: referencias (archivo, sección, tamaño, fecha), no el contenido. */
+  function contextRefs(ctx) {
+    const doc = (p) => state.data.planningDocs?.find((x) => x.path === p);
+    const items = [];
+    for (const d of ctx.alwaysDocs || []) items.push({ type: 'permanent', path: d.path, chars: d.content.length, mtime: doc(d.path)?.mtime ?? null });
+    for (const s of ctx.sections || []) items.push({ type: 'section', source: s.source, path: s.path || null, chars: s.content.length, mtime: doc(s.path)?.mtime ?? null });
+    if (ctx.focusStory) {
+      const p = state.data.details?.[ctx.focusStory.id];
+      items.push({ type: 'focus-story', id: ctx.focusStory.id, path: p?.relativePath || null, chars: ctx.focusStory.markdown.length, mtime: p?.mtime ?? null });
+    }
+    items.push({ type: 'sprint-state', stories: ctx.stories?.length || 0, epics: ctx.epics?.length || 0, language: ctx.project?.communicationLanguage || null });
+    return { docsMode: docsMode(), provider: aiProvider(), model: aiModel(), items };
+  }
+  const refsToSources = (context) => (context?.items || []).filter((i) => i.type !== 'sprint-state').map((i) => i.source || (i.type === 'focus-story' ? `historia ${i.id}` : (i.path || '').split('/').pop()));
+
+  /** Guarda en Supabase los mensajes aún no guardados (en orden; un guardado a la vez). */
+  function persistConversation() {
+    const ai = state.ai;
+    ai.saveChain = (ai.saveChain || Promise.resolve()).then(async () => {
+      const pending = ai.convo.filter((m) => !m.saved && m.content && !m.streaming);
+      if (!pending.length) return;
+      if (!state.session || !state.cloudProjectId) { ai.saveState = 'local'; renderSaveState(); return; }
+      const payload = pending.map((m) => ({ role: m.role, content: m.content, context: m.context, usage: m.usage, createdAt: m.at ? new Date(m.at).toISOString() : undefined }));
+      try {
+        if (!ai.conversationId) {
+          const r = await post(`/api/projects/${state.cloudProjectId}/conversations`, { provider: aiProvider(), model: aiModel(), focusStory: ai.focus, messages: payload, title: ai.title });
+          ai.conversationId = r.id;
+          ai.title = r.title;
+        } else {
+          await post(`/api/conversations/${ai.conversationId}/messages`, { messages: payload, provider: aiProvider(), model: aiModel(), focusStory: ai.focus ?? null });
+        }
+        pending.forEach((m) => (m.saved = true));
+        ai.saveState = 'saved';
+      } catch (err) { ai.saveState = 'error'; ai.saveError = err.message; }
+      renderSaveState();
+    });
+    return ai.saveChain;
+  }
+  function renderSaveState() {
+    const el = $('#ai-save-state');
+    if (!el) return;
+    const ai = state.ai;
+    if (!ai.convo.length) { el.textContent = ''; return; }
+    el.className = 'small-text ' + (ai.saveState === 'error' ? 'hint err' : 'muted');
+    el.textContent = ai.saveState === 'saved' ? `☁ Guardada${ai.title ? ` · ${ai.title}` : ''}` : ai.saveState === 'error' ? `No se pudo guardar: ${ai.saveError}` : ai.saveState === 'local' ? 'Sin guardar en la nube (inicia sesión) · puedes exportarla como JSON' : '';
+  }
+  function addSystemNote(content) { state.ai.convo.push({ role: 'system', content, at: Date.now(), saved: false }); }
+
+  /** Documento JSON portable de una conversación. */
+  function conversationJson(meta, messages) {
+    return {
+      format: CONV_FORMAT,
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      project: { name: state.data?.projectName ?? null, root: state.source?.label || state.source?.path || null },
+      conversation: { id: meta.id ?? null, title: meta.title ?? null, provider: meta.provider ?? null, model: meta.model ?? null, focusStory: meta.focusStory ?? null, createdAt: meta.createdAt ?? null, updatedAt: meta.updatedAt ?? null },
+      messages: messages.map((m, i) => ({
+        seq: i + 1,
+        role: m.role,
+        content: m.content,
+        createdAt: m.at ? new Date(m.at).toISOString() : null,
+        ...(m.context ? { context: m.context } : {}),
+        ...(m.usage ? { usage: m.usage } : {}),
+      })),
+    };
+  }
+  function downloadJson(name, obj) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' }));
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+  const fileSlug = (t) => (t || 'conversacion').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'conversacion';
+
+  function fromStored(m) {
+    return { role: m.role, content: m.content, context: m.context || undefined, usage: m.usage || undefined, sources: m.role === 'user' ? undefined : undefined, at: Date.parse(m.created_at || m.createdAt) || Date.now(), saved: true };
+  }
+  /** Marca en cada respuesta las fuentes del mensaje de usuario que la originó. */
+  function attachSources(convo) {
+    let lastCtx = null;
+    for (const m of convo) {
+      if (m.role === 'user') lastCtx = m.context;
+      else if (m.role === 'assistant' && !m.sources) m.sources = lastCtx ? refsToSources(lastCtx) : undefined;
+    }
+    return convo;
+  }
+  /** Documentos usados en la conversación que cambiaron o ya no existen. */
+  function changedSince(convo) {
+    const out = new Set();
+    for (const m of convo) for (const it of m.context?.items || []) {
+      if (!it.path || !it.mtime) continue;
+      const cur = it.type === 'focus-story' ? state.data.details?.[it.id] : state.data.planningDocs?.find((x) => x.path === it.path);
+      if (!cur) out.add(`${it.path} (ya no existe)`);
+      else if ((cur.mtime || 0) > it.mtime + 1000) out.add(it.path);
+    }
+    return [...out];
+  }
+
+  async function openConversation(cid) {
+    const ai = state.ai;
+    ai.streaming?.abort();
+    const r = await api(`/api/conversations/${cid}`);
+    ai.convo = attachSources(r.messages.map(fromStored));
+    ai.conversationId = cid;
+    ai.title = r.conversation.title;
+    ai.focus = r.conversation.focus_story || null;
+    ai.saveState = 'saved';
+    const changed = changedSince(ai.convo);
+    addSystemNote(`Conversación del ${new Date(r.conversation.created_at).toLocaleString()} cargada. El contexto se vuelve a construir con los archivos actuales.${changed.length ? ` Desde entonces cambiaron: ${changed.join(', ')}.` : ' Los documentos usados no han cambiado.'}`);
+  }
+
+  async function importConversation(file) {
+    const ai = state.ai;
+    let doc;
+    try { doc = JSON.parse(await file.text()); } catch { throw new Error('El archivo no es un JSON válido.'); }
+    if (doc?.format !== CONV_FORMAT || !Array.isArray(doc.messages)) throw new Error('El JSON no es una conversación exportada desde BMAD Dashboard.');
+    if (doc.version > 1) throw new Error(`Versión de formato no soportada (${doc.version}).`);
+    const msgs = doc.messages.filter((m) => ['user', 'assistant', 'system'].includes(m.role) && typeof m.content === 'string' && m.content.trim());
+    ai.streaming?.abort();
+    ai.convo = attachSources(msgs.map((m) => ({ role: m.role, content: m.content, context: m.context, usage: m.usage, at: Date.parse(m.createdAt) || Date.now(), saved: false })));
+    ai.conversationId = null;
+    ai.title = doc.conversation?.title ? `${doc.conversation.title} (importada)` : 'Conversación importada';
+    ai.focus = doc.conversation?.focusStory || null;
+    const changed = changedSince(ai.convo);
+    addSystemNote(`Conversación importada desde ${file.name}${doc.project?.name ? ` (proyecto ${doc.project.name})` : ''}.${changed.length ? ` Desde entonces cambiaron: ${changed.join(', ')}.` : ''}`);
+    await persistConversation();
+  }
+
+  /** Panel con las conversaciones guardadas del proyecto. */
+  async function renderConversationsPanel(panel, rerender) {
+    const ai = state.ai;
+    const logged = !!(state.session && state.cloudProjectId);
+    panel.innerHTML = `
+      <div class="panel-head"><h3>Conversaciones</h3><span class="spacer"></span>
+        <button class="btn small ghost" id="conv-export-current" ${ai.convo.length ? '' : 'disabled'}>Exportar actual (.json)</button>
+        <label class="btn small ghost" style="margin:0">Importar .json<input type="file" id="conv-import" accept="application/json,.json" class="hidden" /></label>
+      </div>
+      <div id="conv-list" class="list">${logged ? '<div class="muted small-text">Cargando…</div>' : '<div class="muted small-text">Inicia sesión para guardar las conversaciones en la nube y abrirlas más tarde. Sin sesión puedes exportarlas e importarlas como JSON.</div>'}</div>`;
+    $('#conv-export-current', panel).addEventListener('click', () => downloadJson(`${fileSlug(ai.title || ai.convo.find((m) => m.role === 'user')?.content)}.json`, conversationJson({ id: ai.conversationId, title: ai.title, provider: aiProvider(), model: aiModel(), focusStory: ai.focus }, ai.convo)));
+    $('#conv-import', panel).addEventListener('change', async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      try { await importConversation(f); toast('Conversación importada'); rerender(); } catch (err) { toast(err.message, true); }
+    });
+    if (!logged) return;
+    try {
+      const list = await api(`/api/projects/${state.cloudProjectId}/conversations`);
+      const el = $('#conv-list', panel);
+      if (!list.length) { el.innerHTML = '<div class="muted small-text">Aún no hay conversaciones guardadas en este proyecto.</div>'; return; }
+      el.innerHTML = list.map((c, i) => `
+        <div class="row-item conv ${c.id === ai.conversationId ? 'active' : ''}" data-conv="${i}">
+          <div class="grow"><div class="title">${esc(c.title)}</div>
+            <div class="meta">${new Date(c.updated_at).toLocaleString()} · ${c.message_count} mensajes · ${esc(c.provider || '')}${c.focus_story ? ` · historia ${esc(c.focus_story)}` : ''}${c.tokens_in ? ` · ${(c.tokens_in + c.tokens_out).toLocaleString()} tokens` : ''}</div></div>
+          <button class="btn small ghost" data-act="json" data-i="${i}" title="Descargar como JSON">JSON</button>
+          <button class="btn small ghost" data-act="rename" data-i="${i}" title="Cambiar título">✎</button>
+          <button class="btn small ghost" data-act="del" data-i="${i}" title="Eliminar">🗑</button>
+        </div>`).join('');
+      el.querySelectorAll('[data-conv]').forEach((row) => row.addEventListener('click', async (e) => {
+        const c = list[Number(row.dataset.conv)];
+        const act = e.target.dataset.act;
+        if (act === 'json') {
+          e.stopPropagation();
+          const r = await api(`/api/conversations/${c.id}`);
+          downloadJson(`${fileSlug(c.title)}.json`, conversationJson({ id: c.id, title: c.title, provider: c.provider, model: c.model, focusStory: c.focus_story, createdAt: c.created_at, updatedAt: c.updated_at }, r.messages.map(fromStored)));
+          return;
+        }
+        if (act === 'rename') {
+          e.stopPropagation();
+          const t = window.prompt('Nuevo título', c.title);
+          if (t && t.trim()) { await api(`/api/conversations/${c.id}`, { method: 'PATCH', body: JSON.stringify({ title: t }) }); if (c.id === ai.conversationId) ai.title = t.trim(); renderConversationsPanel(panel, rerender); }
+          return;
+        }
+        if (act === 'del') {
+          e.stopPropagation();
+          if (e.target.dataset.confirm !== '1') { e.target.dataset.confirm = '1'; e.target.textContent = '¿Eliminar?'; return; }
+          await api(`/api/conversations/${c.id}`, { method: 'DELETE' });
+          if (c.id === ai.conversationId) { ai.conversationId = null; ai.saveState = null; ai.convo.forEach((m) => (m.saved = false)); }
+          toast('Conversación eliminada');
+          renderConversationsPanel(panel, rerender);
+          return;
+        }
+        try { await openConversation(c.id); rerender(); } catch (err) { toast(err.message, true); }
+      }));
+    } catch (err) { $('#conv-list', panel).innerHTML = `<div class="hint err">${esc(err.message)}</div>`; }
+  }
+
   // ---------------- Pestaña Asistente ----------------
   function renderAssistant(view, d) {
     const key = aiKey.get();
@@ -1799,10 +1994,12 @@
             <select id="ai-docs-mode">${[['auto', 'Auto (secciones relevantes)'], ['always', 'Siempre'], ['never', 'Nunca']].map(([v, l]) => `<option value="${v}" ${docsMode() === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>` : '<span class="muted small-text">Vista guardada: sin documentos de planificación</span>'}
           <span class="spacer"></span>
           <span class="muted small-text" title="${d.config?.communication_language ? 'communication_language en ' + esc(d.config._file || 'la configuración BMAD') : 'El proyecto no define communication_language'}">🌐 ${d.config?.communication_language ? esc(d.config.communication_language) + ' (BMAD)' : 'Idioma del usuario'}</span>
+          <button class="btn small ghost" id="ai-convs">🗂 Conversaciones</button>
           <button class="btn small ghost" id="ai-new">Nueva conversación</button>
           <span class="muted small-text" title="API key de ${prov === 'groq' ? 'Groq' : 'Anthropic'}">🔑 ${esc(aiKey.masked(key))}</span>
           <button class="btn small ghost" id="ai-key-clear">Quitar key</button>
         </div>
+        <div class="panel ai-convs hidden" id="ai-convs-panel"></div>
         <div class="ai-chat panel" id="ai-chat">
           <div id="ai-messages" class="ai-messages"></div>
           ${ai.convo.length ? '' : `<div class="ai-empty" id="ai-empty"><p class="muted">Pregunta lo que quieras sobre <b>${esc(d.projectName)}</b>. El asistente conoce el estado de todas las historias, las alertas y los comandos sugeridos${canDocs ? ', y puede leer el PRD y la arquitectura' : ''}.</p>
@@ -1815,17 +2012,20 @@
             <button class="btn primary" type="submit" id="ai-send">Enviar</button>
             <button class="btn hidden" type="button" id="ai-stop">Detener</button>
           </div>
-          <div class="muted small-text" id="ai-usage"></div>
+          <div class="ai-foot"><span class="muted small-text" id="ai-usage"></span><span id="ai-save-state"></span></div>
         </form>
       </div>`;
 
     const list = $('#ai-messages');
     const drawMessages = () => {
-      list.innerHTML = ai.convo.map((m, i) => m.role === 'user'
+      list.innerHTML = ai.convo.map((m, i) => m.role === 'system'
+        ? `<div class="msg system"><div class="sys">ℹ ${esc(m.content)}</div></div>`
+        : m.role === 'user'
         ? `<div class="msg user"><div class="bubble">${esc(m.content).replace(/\n/g, '<br>')}</div></div>`
         : `<div class="msg assistant"><div class="bubble md">${renderMd(m.content || '…')}</div>${m.content ? `<div class="msg-actions"><button class="btn small ghost" data-copymsg="${i}">Copiar</button>${sourcesHtml(m.sources)}</div>` : ''}</div>`).join('');
       list.querySelectorAll('[data-copymsg]').forEach((b) => b.addEventListener('click', () => copy(ai.convo[Number(b.dataset.copymsg)].content)));
       const chat = $('#ai-chat'); chat.scrollTop = chat.scrollHeight;
+      renderSaveState();
     };
     drawMessages();
 
@@ -1836,8 +2036,9 @@
     async function send(content) {
       if (!content.trim() || ai.streaming) return;
       $('#ai-empty')?.remove();
-      ai.convo.push({ role: 'user', content });
-      const reply = { role: 'assistant', content: '' };
+      const userMsg = { role: 'user', content, at: Date.now(), saved: false };
+      ai.convo.push(userMsg);
+      const reply = { role: 'assistant', content: '', streaming: true, saved: false };
       ai.convo.push(reply);
       drawMessages();
       text.value = '';
@@ -1849,7 +2050,9 @@
         const prevUser = ai.convo.filter((m) => m.role === 'user').slice(-2, -1)[0]?.content || '';
         const { ctx: context, sources } = await buildAiContext({ task: 'chat', query: `${content}\n${prevUser}`, focusId: ai.focus });
         reply.sources = sources;
-        const history = ai.convo.slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
+        userMsg.context = contextRefs(context);
+        // Al modelo solo van los mensajes de usuario y asistente (las notas del sistema son del dashboard)
+        const history = ai.convo.slice(0, -1).filter((m) => m.role !== 'system').map((m) => ({ role: m.role, content: m.content }));
         let last = 0;
         const r = await aiStream({
           task: 'chat', messages: history, context, signal: ctrl.signal,
@@ -1859,9 +2062,20 @@
           },
         });
         reply.content = r.text;
+        reply.usage = { ...(r.usage || {}), provider: aiProvider(), model: r.model || aiModel(), stopReason: r.stopReason || null };
+        reply.at = Date.now();
+        delete reply.streaming;
         $('#ai-usage').textContent = usageLine(r.usage) + (r.stopReason === 'max_tokens' ? ' · respuesta recortada por longitud' : '');
+        persistConversation();
       } catch (err) {
-        if (err.name === 'AbortError') { reply.content = (reply.content || '') + '\n\n_(detenido)_'; $('#ai-usage').textContent = 'Respuesta detenida'; }
+        if (err.name === 'AbortError') {
+          reply.content = (reply.content || '') + '\n\n_(detenido)_';
+          reply.at = Date.now();
+          reply.usage = { provider: aiProvider(), model: aiModel(), stopReason: 'stopped' };
+          delete reply.streaming;
+          $('#ai-usage').textContent = 'Respuesta detenida';
+          persistConversation();
+        }
         else {
           ai.convo.splice(ai.convo.indexOf(reply), 1);
           ai.convo.pop();
@@ -1879,10 +2093,22 @@
     text.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(text.value); } });
     $('#ai-stop').addEventListener('click', () => ai.streaming?.abort());
     view.querySelectorAll('[data-quick]').forEach((b) => b.addEventListener('click', () => send(b.dataset.quick)));
-    $('#ai-model').addEventListener('change', (e) => store.set('bmad.aiModel.' + aiProvider(), e.target.value));
-    $('#ai-provider').addEventListener('change', (e) => { store.set('bmad.aiProvider', e.target.value); renderAssistant(view, d); });
+    $('#ai-model').addEventListener('change', (e) => {
+      store.set('bmad.aiModel.' + aiProvider(), e.target.value);
+      if (ai.convo.length) { addSystemNote(`Modelo cambiado a ${MODEL_LABELS[e.target.value] || e.target.value}.`); drawMessages(); }
+    });
+    $('#ai-provider').addEventListener('change', (e) => {
+      store.set('bmad.aiProvider', e.target.value);
+      if (ai.convo.length) addSystemNote(`Proveedor cambiado a ${AI_PROVIDERS[e.target.value].label} (${aiModel(e.target.value)}).`);
+      renderAssistant(view, d);
+    });
+    $('#ai-convs').addEventListener('click', () => {
+      const panel = $('#ai-convs-panel');
+      panel.classList.toggle('hidden');
+      if (!panel.classList.contains('hidden')) renderConversationsPanel(panel, () => renderAssistant(view, d));
+    });
     $('#ai-docs-mode')?.addEventListener('change', (e) => store.set('bmad.aiDocsMode', e.target.value));
-    $('#ai-new').addEventListener('click', () => { ai.streaming?.abort(); ai.convo = []; ai.focus = null; renderAssistant(view, d); });
+    $('#ai-new').addEventListener('click', () => { ai.streaming?.abort(); ai.convo = []; ai.focus = null; ai.conversationId = null; ai.title = null; ai.saveState = null; renderAssistant(view, d); });
     $('#ai-unfocus')?.addEventListener('click', () => { ai.focus = null; renderAssistant(view, d); });
     $('#ai-key-clear').addEventListener('click', () => { aiKey.clear(); toast('API key eliminada de este navegador'); renderAssistant(view, d); });
   }

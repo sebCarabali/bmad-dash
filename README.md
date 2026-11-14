@@ -51,6 +51,25 @@ y el servidor la reenvía al proveedor en cada petición sin almacenarla ni regi
 
 Endpoints: `POST /api/ai/validate` (devuelve los modelos disponibles) y `POST /api/ai/chat` (stream NDJSON), con `provider` en el cuerpo y la key en la cabecera `x-ai-key`.
 
+## Conversaciones del asistente
+
+Con sesión iniciada, cada turno del chat se guarda en Supabase y se puede reabrir desde **🗂 Conversaciones**
+(también renombrar, eliminar, exportar e importar).
+
+**Modelo de datos** (RLS por usuario):
+- `ai_conversations`: un registro por hilo (título, proveedor, modelo, historia en foco, contadores de mensajes y tokens).
+- `ai_messages`: **una fila por mensaje**, solo se añaden (nunca se reescribe el hilo). `role` = `user` | `assistant` | `system`.
+  - `context` (mensajes de usuario, `jsonb`): qué se envió como contexto — **referencias** (`permanent`, `section`, `focus-story`,
+    `sprint-state`) con ruta, sección, tamaño y fecha del archivo. No se copia el contenido de PRD/arquitectura.
+  - `usage` (respuestas, `jsonb`): tokens de entrada/salida/caché, proveedor, modelo y motivo de fin.
+  - `system`: notas del dashboard (conversación cargada, cambio de proveedor/modelo, historia en foco). No se envían al modelo.
+
+Al reabrir una conversación el contexto se reconstruye con los archivos actuales y se avisa si alguno cambió o ya no existe.
+
+**Formato JSON** de exportación/importación (`format: "bmad-dashboard.conversation"`, `version: 1`):
+`{ format, version, exportedAt, project, conversation: { id, title, provider, model, focusStory, createdAt, updatedAt },
+messages: [ { seq, role, content, createdAt, context?, usage? } ] }`.
+
 ## Trabajar desde el dashboard
 
 - **Mover historias**: arrastra una tarjeta del tablero (o usa "Mover a" en el detalle). Se actualizan `sprint-status.yaml`

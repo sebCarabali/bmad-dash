@@ -76,7 +76,7 @@ export class LocalFsService {
     const root = await this.resolveRoot(input);
     const files: VFile[] = [];
     await walk(root, root, 0, files, false);
-    const relevant = files.filter((f) => needsContent(f.path)).sort((a, b) => a.path.localeCompare(b.path));
+    const relevant = files.filter((f) => needsContent(f.path) || /\.md$/i.test(f.path)).sort((a, b) => a.path.localeCompare(b.path));
     const hash = createHash('sha1');
     for (const f of relevant) hash.update(`${f.path}|${Math.round(f.mtime)}|${f.size}\n`);
     hash.update(`total:${files.length}`);
