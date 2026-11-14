@@ -57,8 +57,31 @@ export class ProjectsController {
       .update(JSON.stringify({ s: d.stats, st: d.stories.map((s: any) => [s.id, s.status, s.tasksDone, s.tasksTotal, s.title]) }))
       .digest('hex');
 
-    const { data: last } = await client.from('snapshots').select('signature').eq('project_id', project.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
-    if (last?.signature === signature) return { project, snapshotCreated: false };
+    const { data: last } = await client
+      .from('snapshots')
+      .select('signature, stories:dashboard->stories')
+      .eq('project_id', project.id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (last?.signature === signature) return { project, snapshotCreated: false, events: 0 };
+
+    // Eventos de cambio de estado (base de las métricas del sprint)
+    const prev = new Map<string, { status: string; title?: string }>(((last as any)?.stories ?? []).map((x: any) => [x.id, { status: x.status, title: x.title }]));
+    const events: any[] = [];
+    const ev = (story: any, from: string | null, to: string, kind: string) =>
+      events.push({ project_id: project.id, owner_id: user.id, story_id: String(story.id).slice(0, 20), story_title: String(story.title ?? '').slice(0, 300), epic: Number(story.epic) || null, from_status: from, to_status: to, kind, occurred_at: now });
+    for (const st of d.stories as any[]) {
+      const p = prev.get(st.id);
+      if (!last) ev(st, null, st.status, 'baseline');
+      else if (!p) ev(st, null, st.status, 'change');
+      else if (p.status !== st.status) ev(st, p.status, st.status, 'change');
+    }
+    if (last) for (const [id, p] of prev) if (!(d.stories as any[]).some((x) => x.id === id)) ev({ id, title: p.title, epic: id.split('.')[0] }, p.status, 'removed', 'removed');
+    if (events.length) {
+      const { error: evErr } = await client.from('story_events').insert(events);
+      if (evErr) throw new InternalServerErrorException(evErr.message);
+    }
 
     const { specContext: _omit, ...stored } = d;
     void _omit;
@@ -75,7 +98,7 @@ export class ProjectsController {
       dashboard: stored,
     });
     if (snapErr) throw new InternalServerErrorException(snapErr.message);
-    return { project, snapshotCreated: true };
+    return { project, snapshotCreated: true, events: events.length };
   }
 
   @Get(':id/history')
@@ -89,6 +112,20 @@ export class ProjectsController {
       .limit(120);
     if (error) throw new InternalServerErrorException(error.message);
     return (data ?? []).reverse();
+  }
+
+  /** Transiciones de estado de las historias (para las métricas). */
+  @Get(':id/events')
+  async events(@Headers('authorization') auth: string, @Param('id', ParseUUIDPipe) id: string) {
+    const { client } = await this.supabase.user(auth);
+    const { data, error } = await client
+      .from('story_events')
+      .select('story_id, story_title, epic, from_status, to_status, kind, occurred_at')
+      .eq('project_id', id)
+      .order('occurred_at', { ascending: true })
+      .limit(5000);
+    if (error) throw new InternalServerErrorException(error.message);
+    return data ?? [];
   }
 
   @Get(':id/latest')

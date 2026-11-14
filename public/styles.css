@@ -274,3 +274,19 @@ label { font-weight: 500; font-size: 12.5px; color: var(--ink-2); display: block
 .ai-sources summary { cursor: pointer; }
 .ai-sources ul { margin: 4px 0 0; padding-left: 18px; }
 .msg-actions { display: flex; align-items: flex-start; gap: 4px; flex-wrap: wrap; }
+
+/* ---------- v5: edición, métricas, GitHub y pruebas ---------- */
+.card[draggable="true"] { cursor: grab; }
+.card.dragging { opacity: .45; }
+.col.drop { outline: 2px dashed var(--accent); outline-offset: -4px; background: var(--accent-soft); }
+.task-cb { margin: 2px 0 0; flex: none; cursor: pointer; accent-color: var(--accent); }
+.fix-btns { display: inline-flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.alert .grow { flex: 1; }
+.ib { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; font-weight: 600; padding: 0 6px; border-radius: 5px; border: 1px solid currentColor; white-space: nowrap; }
+.ib.ok { color: var(--s-done); } .ib.fail { color: #dc2626; }
+.ib.pr.open { color: var(--s-ready-for-dev); } .ib.pr.merged { color: #8b5cf6; } .ib.pr.closed { color: var(--muted); } .ib.br { color: var(--muted); }
+.ok-text { color: var(--s-done); } .fail-text { color: #dc2626; }
+.tp-chart { width: 100%; max-width: 620px; height: auto; display: block; }
+.tp-chart .grid-line { stroke: var(--line); } .tp-chart .axis-label { fill: var(--muted); font-size: 11px; } .tp-chart .end-label { fill: var(--ink-2); font-size: 11px; font-weight: 600; }
+.q-table tr.clickable { cursor: pointer; } .q-table tr.clickable:hover td { background: var(--accent-soft); }
+.card .foot2 { flex-wrap: wrap; }

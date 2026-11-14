@@ -51,6 +51,30 @@ y el servidor la reenvía al proveedor en cada petición sin almacenarla ni regi
 
 Endpoints: `POST /api/ai/validate` (devuelve los modelos disponibles) y `POST /api/ai/chat` (stream NDJSON), con `provider` en el cuerpo y la key en la cabecera `x-ai-key`.
 
+## Trabajar desde el dashboard
+
+- **Mover historias**: arrastra una tarjeta del tablero (o usa "Mover a" en el detalle). Se actualizan `sprint-status.yaml`
+  (conservando comentarios) y el `Status:` del archivo de la historia (formato v6 o v4).
+- **Corregir desincronizaciones**: en Alertas o en el detalle, elige qué estado vale (el de sprint-status o el del archivo).
+- **Marcar tareas**: las casillas del detalle escriben `- [x]` en el archivo.
+- **Puerta de calidad**: al pasar a review/done avisa si hay pruebas fallando o un PR abierto.
+
+Funciona en modo carpeta (Chrome/Edge) y en modo local; en la vista de la nube es de solo lectura.
+
+## Métricas del sprint
+
+Al sincronizar (sesión iniciada) se registran los cambios de estado en `story_events` (Supabase, con RLS). La pestaña **Métricas**
+muestra historias terminadas por semana, cycle time (in-progress → done), tiempo medio en cada estado, historias detenidas
+(más de 2 días en progreso o revisión) y una previsión de fecha por épica según el ritmo reciente.
+
+## Git y pruebas
+
+- **GitHub**: el repositorio se detecta desde `.git/config` (o se escribe a mano); token opcional de solo lectura para repos privados,
+  guardado solo en el navegador. Ramas y PRs se vinculan a historias por su clave (`1-3-login-con-jwt`) o id (`story-1.3`, `[1.3]`).
+  Alertas: historia done con PR abierto, PR abierto con la historia sin empezar, PR fusionado sin marcar la historia como done.
+- **Pruebas**: lee reportes JUnit (Maven Surefire/Failsafe, Gradle, `junit*.xml`) y TRX (.NET). Asocia las clases de prueba con los archivos
+  de la *File List* de cada historia (`LoginService.java` ↔ `LoginServiceTest`) y muestra resultados en el tablero, el detalle y las alertas.
+
 ## Vistas
 
 - **Resumen**: KPIs, distribución por estado, tendencia del sprint, foco actual, progreso por épica, siguiente paso, actividad y artefactos.

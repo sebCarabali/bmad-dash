@@ -6,6 +6,7 @@ import * as path from 'path';
 import { isLocalMode } from '../../app.setup';
 import { AnalyzeInput, CONFIG_FILES, IGNORED_DIRS, MAX_FILE_SIZE, METHOD_DIRS, buildDashboard, buildScanContext, needsContent, toSpecContext } from '../core/analyzer';
 import { buildSpec, StorySpecInput, validateSpecInput } from '../core/spec-builder';
+import { isStoryStatus, setSprintStoryStatus, setStoryFileStatus, setTaskChecked } from '../core/story-editor';
 import { CommandStyle, VFile } from '../core/types';
 
 export const BMAD_DIR_NAMES = ['_bmad', 'bmad', '.bmad-core', '_bmad-output', '.bmad'];
@@ -127,6 +128,91 @@ export class LocalFsService {
     return { ...result, sprintStatusContent: undefined, saved: true, savedPath: result.relativeTarget, sprintUpdated };
   }
 
+  /** Cambia el estado de una historia en sprint-status.yaml y en su archivo. */
+  async setStoryStatus(input: string, id: string, status: string, scope: 'both' | 'sprint' | 'file' = 'both') {
+    if (!isStoryStatus(status)) throw new BadRequestException('Estado no válido.');
+    const ctx = buildScanContext(await this.load(input));
+    const story = ctx.parsedStories.find((s) => s.id === id);
+    const entry = ctx.sprint?.stories.find((s) => `${s.epic}.${s.number}` === id);
+    if (!story && !entry) throw new NotFoundException(`No se encontró la historia ${id}`);
+    const changed: string[] = [];
+    if (entry && ctx.sprint && scope !== 'file') {
+      const abs = this.inside(ctx.root, ctx.sprint.relativePath);
+      const r = setSprintStoryStatus(await fs.readFile(abs, 'utf8'), entry.key, status);
+      if (r.changed) {
+        await fs.writeFile(abs, r.content, 'utf8');
+        changed.push(ctx.sprint.relativePath);
+      }
+    }
+    if (story && scope !== 'sprint') {
+      const abs = this.inside(ctx.root, story.relativePath);
+      const r = setStoryFileStatus(await fs.readFile(abs, 'utf8'), status);
+      if (r.changed) {
+        await fs.writeFile(abs, r.content, 'utf8');
+        changed.push(story.relativePath);
+      }
+    }
+    return { changed };
+  }
+
+  /** Marca o desmarca una tarea del archivo de la historia. */
+  async setTask(input: string, id: string, index: number, done: boolean) {
+    const ctx = buildScanContext(await this.load(input));
+    const story = ctx.parsedStories.find((s) => s.id === id);
+    if (!story) throw new NotFoundException(`La historia ${id} no tiene archivo`);
+    const abs = this.inside(ctx.root, story.relativePath);
+    const r = setTaskChecked(await fs.readFile(abs, 'utf8'), index, done);
+    if (r.changed) await fs.writeFile(abs, r.content, 'utf8');
+    return { changed: r.changed };
+  }
+
+  /** Remoto de git (para detectar el repositorio de GitHub). */
+  async gitRemote(input: string) {
+    const root = await this.resolveRoot(input);
+    try {
+      return { config: await fs.readFile(path.join(root, '.git', 'config'), 'utf8') };
+    } catch {
+      return { config: null };
+    }
+  }
+
+  /** Reportes de pruebas: JUnit (Surefire/Failsafe, Gradle, Jest) y TRX (.NET). */
+  async testReports(input: string) {
+    const root = await this.resolveRoot(input);
+    const out: { path: string; mtime: number; content: string }[] = [];
+    let total = 0;
+    const visit = async (dir: string, depth: number) => {
+      if (depth > 7 || out.length >= 400) return;
+      let entries;
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const abs = path.join(dir, e.name);
+        const rel = path.relative(root, abs).split(path.sep).join('/');
+        if (e.isDirectory()) {
+          if (['node_modules', '.git', '_bmad', '.bmad-core', 'obj', '.gradle', '.idea', '.vs', '.vscode'].includes(e.name)) continue;
+          await visit(abs, depth + 1);
+        } else if (isTestReport(rel)) {
+          const st = await fs.stat(abs);
+          if (st.size > 5 * 1024 * 1024 || total > 20 * 1024 * 1024) continue;
+          total += st.size;
+          out.push({ path: rel, mtime: st.mtimeMs, content: await fs.readFile(abs, 'utf8') });
+        }
+      }
+    };
+    await visit(root, 0);
+    return out;
+  }
+
+  private inside(root: string, rel: string) {
+    const abs = path.resolve(root, rel);
+    if (!abs.startsWith(root + path.sep)) throw new BadRequestException('Ruta fuera del proyecto');
+    return abs;
+  }
+
   async listDir(input?: string) {
     this.assertLocal();
     let dir = input && input.trim() ? input.trim() : process.env.BMAD_DEFAULT_DIR || os.homedir();
@@ -187,6 +273,13 @@ async function walk(root: string, dir: string, depth: number, out: VFile[], with
       }
     }
   }
+}
+
+export function isTestReport(rel: string): boolean {
+  const p = rel.toLowerCase();
+  if (p.endsWith('.trx')) return true;
+  if (!p.endsWith('.xml')) return false;
+  return /(surefire|failsafe)-reports\/test-[^/]+\.xml$/.test(p) || /build\/test-results\/[^/]+\/[^/]+\.xml$/.test(p) || /(^|\/)(junit|test-results?|testresults)[^/]*\.xml$/.test(p) || /(^|\/)test-results\/[^/]+\.xml$/.test(p);
 }
 
 async function exists(p: string) {

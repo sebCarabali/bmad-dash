@@ -36,6 +36,26 @@ export class LocalController {
     return this.local.saveSpec(body?.path, body?.spec);
   }
 
+  @Post('story/status')
+  storyStatus(@Body() body: { path: string; id: string; status: string; scope?: 'both' | 'sprint' | 'file' }) {
+    return this.local.setStoryStatus(body?.path, body?.id, body?.status, body?.scope ?? 'both');
+  }
+
+  @Post('story/task')
+  storyTask(@Body() body: { path: string; id: string; index: number; done: boolean }) {
+    return this.local.setTask(body?.path, body?.id, Number(body?.index), !!body?.done);
+  }
+
+  @Get('git')
+  git(@Query('path') path: string) {
+    return this.local.gitRemote(path);
+  }
+
+  @Get('tests')
+  tests(@Query('path') path: string) {
+    return this.local.testReports(path);
+  }
+
   @Get('fs')
   list(@Query('path') path?: string) {
     return this.local.listDir(path);

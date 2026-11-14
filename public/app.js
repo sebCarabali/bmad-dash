@@ -13,7 +13,7 @@
     contexted: 'Con contexto',
   };
   const VERSION_LABEL = { v6: 'BMAD v6', 'v6-alpha': 'BMAD v6 (alpha)', v4: 'BMAD v4', unknown: 'BMAD (no detectado)' };
-  const TABS = ['resumen', 'tablero', 'epicas', 'comandos', 'nueva', 'alertas', 'asistente'];
+  const TABS = ['resumen', 'tablero', 'epicas', 'metricas', 'calidad', 'comandos', 'nueva', 'alertas', 'asistente'];
   const STORY_FILE_RE = /^(\d+)[-.](\d+)(?:[-.](.+))?\.md$/i;
   const EPICS_FILE_RE = /^(epics?|epic[-_ ]?\d+.*|.*[-_]epics?)\.md$/i;
   const HAS_FS_ACCESS = typeof window.showDirectoryPicker === 'function';
@@ -184,6 +184,7 @@
     const files = [];
     const markers = new Set();
     const raw = new Map();
+    const testFiles = [];
     const maxSize = state.config.scan.maxFileSize;
     for (const file of all) {
       const parts = file.webkitRelativePath.split('/').slice(1);
@@ -191,6 +192,7 @@
       markers.add(parts[0]);
       if (parts[0] === 'bmad' && parts[1] === 'bmm') markers.add('bmad/bmm');
       const rel = parts.join('/');
+      if (isTestReportPath(rel)) testFiles.push({ path: rel, file });
       const isConfig = state.config.scan.configFiles.includes(rel);
       if (!isConfig && parts.slice(0, -1).some((d, i) => skipDir(d, i))) continue;
       if (!/\.(md|ya?ml)$/i.test(file.name)) continue;
@@ -199,7 +201,7 @@
       files.push(f);
       raw.set(rel, file);
     }
-    return { label, files, markers: [...markers], raw };
+    return { label, files, markers: [...markers], raw, testFiles };
   }
 
   async function getFileHandle(root, rel, create) {
@@ -230,6 +232,7 @@
   // =====================================================================
   function showStart(msg) {
     stopWatching();
+    clearInterval(state.intTimer);
     state.source = null;
     state.data = null;
     $('#app').classList.add('hidden');
@@ -299,8 +302,8 @@
     if (!e.target.files.length) return;
     setHint('#pick-hint', 'Leyendo archivos…');
     try {
-      const { label, files, markers, raw } = await readFileList(e.target.files);
-      state.source = { kind: 'browser', handle: null, label, files: new Map(files.map((f) => [f.path, f])), markers, raw };
+      const { label, files, markers, raw, testFiles } = await readFileList(e.target.files);
+      state.source = { kind: 'browser', handle: null, label, files: new Map(files.map((f) => [f.path, f])), markers, raw, testFiles };
       await enterDashboard();
     } catch (err) { setHint('#pick-hint', err.message, 'err'); }
     e.target.value = '';
@@ -522,6 +525,12 @@
     $('#live-toggle').checked = store.get('bmad.live', true);
     if ($('#live-toggle').checked) startWatching(); else renderLiveState();
     if (readOnly()) loadHistory(); else syncToCloud();
+    clearInterval(state.intTimer);
+    state.gh = null; state.tests = null;
+    if (!readOnly()) {
+      refreshIntegrations();
+      state.intTimer = setInterval(() => document.visibilityState === 'visible' && state.watch?.mode !== 'none' && refreshIntegrations(), 60000);
+    }
   }
 
   // ---------------- Actualización en vivo ----------------
@@ -697,13 +706,13 @@
       banner.innerHTML = `<span>☁ Vista de solo lectura del último snapshot (${src.at ? new Date(src.at).toLocaleString() : ''}). Para ver el estado en vivo y crear historias, abre la carpeta del proyecto.</span><button class="btn small" id="banner-open">Abrir carpeta</button>`;
       $('#banner-open').addEventListener('click', () => showStart());
     } else banner.classList.add('hidden');
-    $('#alert-count').textContent = d.alerts.filter((a) => a.level !== 'info').length || '';
+    $('#alert-count').textContent = alertCount(d) || '';
     const tab = currentTab();
     document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
     const view = $('#view');
     const editing = keepScroll && ((tab === 'nueva' && $('#spec-form')) || (tab === 'asistente' && $('#ai-chat')));
     if (!editing) {
-      ({ resumen: renderSummary, tablero: renderBoard, epicas: renderEpics, comandos: renderCommands, nueva: renderSpec, alertas: renderAlerts, asistente: renderAssistant })[tab](view, d);
+      ({ resumen: renderSummary, tablero: renderBoard, epicas: renderEpics, metricas: renderMetrics, calidad: renderQuality, comandos: renderCommands, nueva: renderSpec, alertas: renderAlerts, asistente: renderAssistant })[tab](view, d);
     }
     $('#foot').textContent = `${d.scannedFiles} archivos analizados · sprint-status: ${d.sprintStatusFile || 'no encontrado'} · historias en ${d.storiesDirRelative} · actualizado ${new Date(d.generatedAt).toLocaleTimeString()}`;
     renderSyncState();
@@ -876,13 +885,14 @@
         <input type="text" id="f-q" placeholder="Buscar historia…" value="${esc(f.q)}" />
         <select id="f-epic"><option value="">Todas las épicas</option>${d.epics.map((e) => `<option value="${e.number}" ${String(e.number) === f.epic ? 'selected' : ''}>Épica ${e.number}: ${esc(e.title)}</option>`).join('')}</select>
       </div>
+      ${canEdit() ? '<div class="tip" style="margin:-6px 0 10px">Arrastra una tarjeta a otra columna para cambiar su estado: se actualizan <code>sprint-status.yaml</code> y el archivo de la historia.</div>' : ''}
       <div class="board" id="board"></div>`;
     const draw = () => {
       const qv = f.q.toLowerCase();
       const items = d.stories.filter((s) => (!f.epic || String(s.epic) === f.epic) && (!qv || (s.id + ' ' + s.title).toLowerCase().includes(qv)));
       $('#board').innerHTML = STATUSES.map((st) => {
         const col = items.filter((s) => s.status === st);
-        return `<div class="col"><div class="col-head"><i class="dot" style="background:var(--s-${st})"></i>${STATUS_LABEL[st]}<span class="count">${col.length}</span></div>
+        return `<div class="col" data-col="${st}"><div class="col-head"><i class="dot" style="background:var(--s-${st})"></i>${STATUS_LABEL[st]}<span class="count">${col.length}</span></div>
           ${col.map((s) => `
             <div class="card ${state.flash?.has(s.id) ? 'flash' : ''}" style="--c:var(--s-${st})" data-story="${esc(s.id)}">
               <div class="id">${esc(s.id)} <span class="tag">E${s.epic}</span>${s.warnings.length ? `<span class="warn-ico" title="${esc(s.warnings.join('\n'))}">⚠</span>` : ''}${!s.hasFile && st !== 'backlog' ? '<span class="muted" title="Sin archivo">∅</span>' : ''}</div>
@@ -890,11 +900,13 @@
               <div class="foot2">
                 ${s.tasksTotal ? `<div class="bar"><span style="width:${pct(s.tasksDone, s.tasksTotal)}%;background:var(--s-${st})"></span></div><span>${s.tasksDone}/${s.tasksTotal}</span>` : `<span>${s.hasFile ? 'sin tareas' : s.planned ? 'planificada' : ''}</span>`}
                 ${s.pendingReviewItems ? `<span title="Hallazgos de revisión pendientes" style="color:var(--s-review)">● ${s.pendingReviewItems}</span>` : ''}
+                ${integrationBadges(s)}
               </div>
             </div>`).join('') || '<div class="muted" style="font-size:12px;padding:6px">—</div>'}
         </div>`;
       }).join('');
       bindCommon($('#board'));
+      bindBoardDnD($('#board'));
     };
     $('#f-q').addEventListener('input', (e) => { f.q = e.target.value; draw(); });
     $('#f-epic').addEventListener('change', (e) => { f.epic = e.target.value; draw(); });
@@ -972,10 +984,16 @@
 
   // ---------------- Alertas ----------------
   function renderAlerts(view, d) {
-    view.innerHTML = `<div class="panel-head"><h2>Alertas y consistencia</h2><span class="muted">${d.alerts.length} hallazgo(s)</span></div>` +
-      (d.alerts.length
-        ? d.alerts.map((a) => `<div class="alert ${a.level} ${a.storyId ? 'clickable' : ''}" ${a.storyId ? `data-story="${esc(a.storyId)}"` : ''}><span class="lvl">${{ error: 'Error', warning: 'Aviso', info: 'Info' }[a.level]}</span><span>${esc(a.message)}</span></div>`).join('')
-        : '<div class="panel empty">✓ Todo consistente: sprint-status y archivos de historias coinciden.</div>');
+    const row = (a) => {
+      const s = a.storyId && /desincronizado/i.test(a.message) ? d.stories.find((x) => x.id === a.storyId) : null;
+      return `<div class="alert ${a.level} ${a.storyId ? 'clickable' : ''}" ${a.storyId ? `data-story="${esc(a.storyId)}"` : ''}><span class="lvl">${{ error: 'Error', warning: 'Aviso', info: 'Info' }[a.level]}</span><span class="grow">${esc(a.message)}</span>${s ? desyncFixHtml(s) : ''}</div>`;
+    };
+    const git = gitAlerts(), tests = testAlerts();
+    view.innerHTML = `<div class="panel-head"><h2>Alertas y consistencia</h2><span class="muted">${d.alerts.length + git.length + tests.length} hallazgo(s)</span></div>` +
+      (d.alerts.length ? d.alerts.map(row).join('') : '<div class="panel empty">✓ Todo consistente: sprint-status y archivos de historias coinciden.</div>') +
+      (git.length ? `<div class="panel-head" style="margin-top:18px"><h2>GitHub</h2></div>${git.map(row).join('')}` : '') +
+      (tests.length ? `<div class="panel-head" style="margin-top:18px"><h2>Pruebas</h2></div>${tests.map(row).join('')}` : '');
+    bindFixButtons(view);
     bindCommon(view);
   }
 
@@ -1325,16 +1343,17 @@
         <span class="tag">Historia ${esc(id)}</span>
         <h2>${esc(s ? s.title : p?.title || planned?.title || id)}</h2>
         ${s ? pill(s.status) : ''}
+        ${s && canEdit() && (s.hasFile || s.status === 'backlog') ? `<label class="field-inline small-text">Mover a <select id="story-status">${STATUSES.map((st) => `<option value="${st}" ${st === s.status ? 'selected' : ''}>${STATUS_LABEL[st]}</option>`).join('')}</select></label>` : ''}
       </div>
       <div class="muted mono" style="font-size:12px">${p ? esc(p.relativePath) : 'Sin archivo todavía (solo en planificación / sprint-status)'}</div>
       ${s?.sprintStatus || s?.fileStatus ? `<div class="tip">sprint-status: <b>${esc(s.sprintStatus || '—')}</b> · archivo: <b>${esc(s.fileStatus || '—')}</b>${p ? ` · modificado ${timeAgo(p.mtime)}` : ''}</div>` : ''}
-      ${s?.warnings.length ? `<div class="alert warning" style="margin-top:10px"><span class="lvl">Aviso</span><span>${s.warnings.map(esc).join('<br>')}</span></div>` : ''}
+      ${s?.warnings.length ? `<div class="alert warning" style="margin-top:10px"><span class="lvl">Aviso</span><span class="grow">${s.warnings.map(esc).join('<br>')}</span>${desyncFixHtml(s)}</div>` : ''}
       ${p?.userStory || planned?.userStory ? `<p style="margin-top:12px;font-style:italic;color:var(--ink-2)">${esc(p?.userStory || planned.userStory)}</p>` : ''}
       ${sugg.length ? `<div style="margin-top:14px">${sugg.map(suggestionCard).join('')}</div>` : ''}
       <div class="detail-grid">
         <div>
           <h3>Tareas ${tasks.length ? `<span class="muted">(${p.tasksDone}/${p.tasksTotal})</span>` : ''}</h3>
-          ${tasks.length ? `<div class="bar" style="margin:6px 0 10px"><span style="width:${pct(p.tasksDone, p.tasksTotal)}%"></span></div>` + tasks.map((t) => `<div class="task ${t.done ? 'done' : ''}" style="padding-left:${t.level * 18}px"><span class="box">${t.done ? '☑' : '☐'}</span><span>${t.reviewFollowUp ? '<span class="tag" style="color:var(--s-review)">AI-Review</span> ' : ''}${esc(t.text)}</span></div>`).join('') : '<div class="muted">Sin tareas definidas.</div>'}
+          ${tasks.length ? `<div class="bar" style="margin:6px 0 10px"><span style="width:${pct(p.tasksDone, p.tasksTotal)}%"></span></div>` + tasks.map((t, i) => `<div class="task ${t.done ? 'done' : ''}" style="padding-left:${t.level * 18}px">${canEdit() ? `<input type="checkbox" class="task-cb" data-ti="${i}" ${t.done ? 'checked' : ''} title="Marcar / desmarcar en el archivo" />` : `<span class="box">${t.done ? '☑' : '☐'}</span>`}<span>${t.reviewFollowUp ? '<span class="tag" style="color:var(--s-review)">AI-Review</span> ' : ''}${esc(t.text)}</span></div>`).join('') : '<div class="muted">Sin tareas definidas.</div>'}
         </div>
         <div>
           <h3>Criterios de aceptación</h3>
@@ -1343,6 +1362,7 @@
           ${p?.fileList?.length ? `<h3 style="margin-top:12px">Archivos tocados</h3><ul class="mono" style="font-size:12px;padding-left:18px">${p.fileList.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : ''}
         </div>
       </div>
+      ${s && !readOnly() ? storyIntegrationHtml(id) : ''}
       <div class="actions">
         <button class="btn ai" id="ask-claude">✨ Preguntar al asistente sobre esta historia</button>
         ${!p && s && !readOnly() ? `<button class="btn primary" id="create-from">Crear especificación de esta historia</button>` : ''}
@@ -1356,6 +1376,13 @@
     body.querySelectorAll('[data-story]').forEach((b) => b.remove());
     $('#toggle-raw')?.addEventListener('click', () => { $('#md-render').classList.toggle('hidden'); $('#md-raw').classList.toggle('hidden'); });
     $('#copy-raw')?.addEventListener('click', () => copy(markdown));
+    $('#story-status')?.addEventListener('change', async (e) => { e.target.disabled = true; if (await changeStoryStatus(id, e.target.value)) openStory(id); else e.target.disabled = false; });
+    body.querySelectorAll('.task-cb').forEach((cb) => cb.addEventListener('change', async () => {
+      body.querySelectorAll('.task-cb').forEach((x) => (x.disabled = true));
+      await toggleTask(id, Number(cb.dataset.ti), cb.checked);
+      openStory(id);
+    }));
+    bindFixButtons(body, () => openStory(id));
     $('#ask-claude')?.addEventListener('click', () => {
       closeModal();
       state.ai.focus = id;
@@ -1858,6 +1885,542 @@
     $('#ai-new').addEventListener('click', () => { ai.streaming?.abort(); ai.convo = []; ai.focus = null; renderAssistant(view, d); });
     $('#ai-unfocus')?.addEventListener('click', () => { ai.focus = null; renderAssistant(view, d); });
     $('#ai-key-clear').addEventListener('click', () => { aiKey.clear(); toast('API key eliminada de este navegador'); renderAssistant(view, d); });
+  }
+
+  // =====================================================================
+  //  1. Edición desde el dashboard: estados, tareas y desincronizaciones
+  // =====================================================================
+  const canEdit = () => !readOnly() && (state.source?.kind === 'local' || (state.source?.kind === 'browser' && !!state.source.handle));
+  const STATUS_NORM = { draft: 'drafted', approved: 'ready-for-dev', ready: 'ready-for-dev', inprogress: 'in-progress', 'ready-for-review': 'review', 'in-review': 'review', completed: 'done', complete: 'done', todo: 'backlog' };
+  function normStatus(raw) {
+    const s = String(raw || '').toLowerCase().replace(/[*_`"']/g, '').trim().replace(/\s+/g, '-');
+    return STATUSES.includes(s) ? s : STATUS_NORM[s] || STATUS_NORM[s.replace(/-/g, '')] || null;
+  }
+  async function readFresh(rel) {
+    return (await (await getFileHandle(state.source.handle, rel, false)).getFile()).text();
+  }
+
+  /** Cambia el estado de una historia. scope: 'both' | 'sprint' (solo sprint-status) | 'file' (solo el archivo). */
+  async function changeStoryStatus(id, status, scope = 'both') {
+    const d = state.data;
+    const s = d.stories.find((x) => x.id === id);
+    if (!s || !canEdit()) return false;
+    if (scope === 'both' && s.status === status && normStatus(s.fileStatus) === status) return false;
+    if (!s.hasFile && status !== 'backlog') {
+      toast(`La historia ${id} aún no tiene archivo: créala en "Nueva historia" antes de moverla.`, true);
+      return false;
+    }
+    const t = state.tests?.byStory?.[id];
+    if ((status === 'done' || status === 'review') && t?.failed && !window.confirm(`La historia ${id} tiene ${t.failed} prueba(s) fallando.\n¿Moverla a "${STATUS_LABEL[status]}" de todos modos?`)) return false;
+    const g = state.gh?.byStory?.[id];
+    if (status === 'done' && g?.prs?.some((p) => p.state === 'open') && !window.confirm(`La historia ${id} tiene un PR abierto sin fusionar.\n¿Marcarla como hecha de todos modos?`)) return false;
+    try {
+      if (state.source.kind === 'local') {
+        await post('/api/local/story/status', { path: state.source.path, id, status, scope });
+      } else {
+        const root = state.source.handle;
+        if (!(await ensurePermission(root, 'readwrite'))) throw new Error('Necesito permiso de escritura en la carpeta para cambiar el estado.');
+        const body = { key: s.key, status };
+        if (scope !== 'file' && s.sprintStatus !== undefined && d.sprintStatusFile) body.sprintStatus = await readFresh(d.sprintStatusFile);
+        if (scope !== 'sprint' && s.hasFile && s.relativePath) body.storyFile = await readFresh(s.relativePath);
+        const r = await post('/api/edit/status', body);
+        if (r.sprintChanged) await writeText(root, d.sprintStatusFile, r.sprintStatus);
+        if (r.storyChanged) await writeText(root, s.relativePath, r.storyFile);
+      }
+      await check();
+      return true;
+    } catch (err) { toast(err.message, true); return false; }
+  }
+
+  async function toggleTask(id, index, done) {
+    const s = state.data.stories.find((x) => x.id === id);
+    if (!s?.hasFile || !canEdit()) return;
+    try {
+      if (state.source.kind === 'local') await post('/api/local/story/task', { path: state.source.path, id, index, done });
+      else {
+        const root = state.source.handle;
+        if (!(await ensurePermission(root, 'readwrite'))) throw new Error('Necesito permiso de escritura en la carpeta.');
+        const r = await post('/api/edit/task', { storyFile: await readFresh(s.relativePath), index, done });
+        if (r.changed) await writeText(root, s.relativePath, r.content);
+      }
+      await check();
+    } catch (err) { toast(err.message, true); }
+  }
+
+  /** Botones para resolver una desincronización entre sprint-status y el archivo. */
+  function desyncFixHtml(s) {
+    if (!canEdit() || !s?.sprintStatus || !s?.fileStatus) return '';
+    const sp = normStatus(s.sprintStatus), fi = normStatus(s.fileStatus);
+    if (!sp || !fi || sp === fi) return '';
+    return `<span class="fix-btns">
+      <button class="btn small" data-fix="${esc(s.id)}" data-status="${sp}" data-scope="file" title="Escribe '${sp}' en el archivo de la historia">Usar "${esc(STATUS_LABEL[sp])}" (sprint-status)</button>
+      <button class="btn small" data-fix="${esc(s.id)}" data-status="${fi}" data-scope="sprint" title="Escribe '${fi}' en sprint-status.yaml">Usar "${esc(STATUS_LABEL[fi])}" (archivo)</button></span>`;
+  }
+  function bindFixButtons(root, after) {
+    root.querySelectorAll('[data-fix]').forEach((b) => b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      b.disabled = true;
+      if (await changeStoryStatus(b.dataset.fix, b.dataset.status, b.dataset.scope)) after?.();
+      b.disabled = false;
+    }));
+  }
+
+  /** Arrastrar y soltar en el tablero. */
+  function bindBoardDnD(board) {
+    if (!canEdit()) return;
+    board.querySelectorAll('.card[data-story]').forEach((c) => {
+      c.draggable = true;
+      c.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', c.dataset.story); e.dataTransfer.effectAllowed = 'move'; c.classList.add('dragging'); });
+      c.addEventListener('dragend', () => c.classList.remove('dragging'));
+    });
+    board.querySelectorAll('.col[data-col]').forEach((col) => {
+      col.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; col.classList.add('drop'); });
+      col.addEventListener('dragleave', (e) => { if (!col.contains(e.relatedTarget)) col.classList.remove('drop'); });
+      col.addEventListener('drop', (e) => {
+        e.preventDefault();
+        col.classList.remove('drop');
+        const id = e.dataTransfer.getData('text/plain');
+        if (id) changeStoryStatus(id, col.dataset.col);
+      });
+    });
+  }
+
+  // =====================================================================
+  //  2. Métricas del sprint (eventos guardados en Supabase)
+  // =====================================================================
+  const DAY = 86400000;
+  function fmtDur(ms) {
+    if (ms == null || !isFinite(ms)) return '—';
+    if (ms < 3600000) return `${Math.max(1, Math.round(ms / 60000))} min`;
+    if (ms < 2 * DAY) return `${(ms / 3600000).toFixed(1)} h`;
+    return `${(ms / DAY).toFixed(1)} días`;
+  }
+  const weekStart = (t) => { const d = new Date(t); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return d.getTime(); };
+
+  function computeMetrics(events, stories) {
+    const now = Date.now();
+    const seqs = new Map();
+    for (const e of events) {
+      if (!seqs.has(e.story_id)) seqs.set(e.story_id, []);
+      seqs.get(e.story_id).push({ status: e.to_status, at: Date.parse(e.occurred_at), kind: e.kind, title: e.story_title, epic: e.epic });
+    }
+    const statusTime = {};
+    const cycles = [];
+    const stuck = [];
+    for (const [id, seq] of seqs) {
+      seq.sort((a, b) => a.at - b.at);
+      for (let i = 0; i < seq.length - 1; i++) {
+        const st = seq[i].status;
+        if (seq[i].kind === 'baseline' && i === 0) continue; // no sabemos cuándo entró en ese estado
+        (statusTime[st] ||= []).push(seq[i + 1].at - seq[i].at);
+      }
+      const start = seq.find((x) => x.kind === 'change' && x.status === 'in-progress');
+      const done = start && seq.find((x) => x.kind === 'change' && x.status === 'done' && x.at >= start.at);
+      if (start && done) cycles.push({ id, title: seq[0].title, ms: done.at - start.at, doneAt: done.at });
+      const last = seq[seq.length - 1];
+      if (['in-progress', 'review'].includes(last.status) && last.kind === 'change' && now - last.at > 2 * DAY) stuck.push({ id, title: last.title, status: last.status, ms: now - last.at });
+    }
+    const doneEvents = events.filter((e) => e.kind === 'change' && e.to_status === 'done');
+    const firstAt = events.length ? Date.parse(events[0].occurred_at) : now;
+    const thisWeek = weekStart(now);
+    const weeks = [];
+    for (let i = 7; i >= 0; i--) {
+      const ws = thisWeek - i * 7 * DAY;
+      weeks.push({ start: ws, count: doneEvents.filter((e) => { const t = Date.parse(e.occurred_at); return t >= ws && t < ws + 7 * DAY; }).length, tracked: ws + 7 * DAY > firstAt });
+    }
+    // Ritmo: historias terminadas por semana en las últimas 4 semanas con datos
+    const span = Math.min(4, Math.max(1, Math.ceil((now - firstAt) / (7 * DAY))));
+    const recent = doneEvents.filter((e) => Date.parse(e.occurred_at) >= now - span * 7 * DAY).length;
+    const rate = recent / span;
+    const epics = new Map();
+    for (const s of stories) {
+      if (!epics.has(s.epic)) epics.set(s.epic, { epic: s.epic, pending: 0, total: 0 });
+      const e = epics.get(s.epic);
+      e.total++;
+      if (s.status !== 'done') e.pending++;
+    }
+    const forecast = [...epics.values()].sort((a, b) => a.epic - b.epic).map((e) => ({ ...e, weeks: rate > 0 ? e.pending / rate : null }));
+    let cum = 0;
+    for (const f of forecast) { if (f.weeks != null) { cum += f.weeks; f.cumWeeks = cum; f.date = now + cum * 7 * DAY; } }
+    const avg = (arr) => (arr?.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+    return {
+      firstAt, rate, weeks, stuck: stuck.sort((a, b) => b.ms - a.ms), forecast,
+      cycles: cycles.sort((a, b) => b.doneAt - a.doneAt),
+      avgCycle: avg(cycles.map((c) => c.ms)),
+      statusAvg: ['drafted', 'ready-for-dev', 'in-progress', 'review'].map((st) => ({ status: st, avg: avg(statusTime[st]), n: statusTime[st]?.length || 0 })),
+      doneTotal: doneEvents.length,
+    };
+  }
+
+  function throughputChart(weeks) {
+    const W = 560, H = 180, L = 28, B = 26, T = 22;
+    const max = Math.max(1, ...weeks.map((w) => w.count));
+    const bw = (W - L) / weeks.length;
+    const y = (v) => T + (1 - v / max) * (H - T - B);
+    const fmt = (t) => new Date(t).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+    return `<svg viewBox="0 0 ${W} ${H}" class="tp-chart" role="img" aria-label="Historias terminadas por semana">
+      ${[0, Math.ceil(max / 2), max].map((t) => `<line class="grid-line" x1="${L}" x2="${W}" y1="${y(t)}" y2="${y(t)}"/><text class="axis-label" x="${L - 6}" y="${y(t) + 4}" text-anchor="end">${t}</text>`).join('')}
+      ${weeks.map((w, i) => {
+        const x = L + i * bw + bw * 0.2, h = H - B - y(w.count);
+        return `<g><title>Semana del ${fmt(w.start)}: ${w.count} historia(s) terminada(s)${w.tracked ? '' : ' (sin datos)'}</title>
+          ${w.count ? `<path d="M${x},${H - B} v${-(h - 4)} q0,-4 4,-4 h${bw * 0.6 - 8} q4,0 4,4 v${h - 4} z" fill="var(--c-done)"/>` : ''}
+          <text class="axis-label" x="${x + bw * 0.3}" y="${H - 8}" text-anchor="middle">${fmt(w.start)}</text>
+          ${w.count ? `<text class="end-label" x="${x + bw * 0.3}" y="${y(w.count) - 4}" text-anchor="middle">${w.count}</text>` : ''}</g>`;
+      }).join('')}
+    </svg>`;
+  }
+
+  async function renderMetrics(view, d) {
+    const head = '<div class="panel-head"><h2>Métricas del sprint</h2><span class="muted">a partir de los cambios de estado registrados</span></div>';
+    if (!state.sb) { view.innerHTML = head + '<div class="panel empty">Las métricas necesitan Supabase configurado en el servidor.</div>'; return; }
+    if (!state.session) { view.innerHTML = head + '<div class="panel empty">Inicia sesión (pantalla de inicio → "Guarda tu historial en la nube") para registrar los cambios de estado y ver métricas.</div>'; return; }
+    if (!state.cloudProjectId) { view.innerHTML = head + '<div class="panel empty">Sincronizando el proyecto con la nube…</div>'; setTimeout(() => currentTab() === 'metricas' && state.cloudProjectId && render(), 1500); return; }
+    view.innerHTML = head + '<div class="loading">Calculando métricas…</div>';
+    let events;
+    try { events = await api(`/api/projects/${state.cloudProjectId}/events`); }
+    catch (err) { view.innerHTML = head + `<div class="panel empty">${esc(err.message)}</div>`; return; }
+    if (currentTab() !== 'metricas') return;
+    const m = computeMetrics(events, d.stories);
+    const changes = events.filter((e) => e.kind === 'change').length;
+    const epicTitle = (n) => d.epics.find((e) => e.number === n)?.title || `Épica ${n}`;
+    view.innerHTML = head + `
+      <div class="tip" style="margin:-6px 0 14px">Datos desde ${new Date(m.firstAt).toLocaleDateString()} · ${changes} cambio(s) de estado registrados. Los cambios se registran cada vez que el dashboard sincroniza (proyecto abierto y sesión iniciada).</div>
+      <div class="grid kpis">
+        ${kpi('Terminadas (registradas)', m.doneTotal, 'pasaron a done mientras se medía')}
+        ${kpi('Cycle time medio', fmtDur(m.avgCycle), 'de in-progress a done')}
+        ${kpi('Ritmo', `${m.rate.toFixed(1)}/sem`, 'historias terminadas por semana')}
+        ${kpi('Detenidas', m.stuck.length, 'más de 2 días en progreso o revisión')}
+      </div>
+      <div class="grid two" style="margin-top:16px">
+        <div class="panel">
+          <div class="panel-head"><h2>Historias terminadas por semana</h2></div>
+          ${m.doneTotal ? throughputChart(m.weeks) : '<div class="empty">Aún no se ha registrado ninguna historia terminada.</div>'}
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Tiempo medio en cada estado</h2></div>
+          <table class="trend-table"><tr><th>Estado</th><th>Tiempo medio</th><th>Muestras</th></tr>
+          ${m.statusAvg.map((x) => `<tr><td>${pill(x.status)}</td><td>${fmtDur(x.avg)}</td><td>${x.n}</td></tr>`).join('')}</table>
+          <p class="tip">Solo cuenta los tramos completos observados (no el estado inicial al empezar a medir).</p>
+        </div>
+      </div>
+      <div class="grid two" style="margin-top:16px">
+        <div class="panel">
+          <div class="panel-head"><h2>Previsión por épica</h2><span class="muted">al ritmo actual, en orden de épicas</span></div>
+          ${m.rate > 0 ? `<table class="trend-table"><tr><th>Épica</th><th>Pendientes</th><th>Semanas</th><th>Fecha estimada</th></tr>
+            ${m.forecast.filter((f) => f.pending).map((f) => `<tr><td>${f.epic}. ${esc(epicTitle(f.epic))}</td><td>${f.pending}/${f.total}</td><td>${f.weeks.toFixed(1)}</td><td>${new Date(f.date).toLocaleDateString()}</td></tr>`).join('') || '<tr><td colspan="4">Todas las épicas terminadas 🎉</td></tr>'}</table>
+            <p class="tip">Estimación lineal con el ritmo de las últimas semanas; tómala como orientación.</p>` : '<div class="empty">Se necesita al menos una historia terminada mientras se mide para estimar fechas.</div>'}
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Historias detenidas</h2></div>
+          <div class="list">${m.stuck.length ? m.stuck.map((x) => `<div class="row-item" data-story="${esc(x.id)}"><span class="tag">${esc(x.id)}</span><div class="grow"><div class="title">${esc(x.title || '')}</div></div>${pill(x.status)}<span class="meta">${fmtDur(x.ms)}</span></div>`).join('') : '<div class="empty">Ninguna historia lleva más de 2 días en progreso o revisión.</div>'}</div>
+          <div class="panel-head" style="margin-top:16px"><h2>Cycle time por historia</h2></div>
+          ${m.cycles.length ? `<table class="trend-table"><tr><th>Historia</th><th>Cycle time</th><th>Terminada</th></tr>${m.cycles.slice(0, 15).map((c) => `<tr><td>${esc(c.id)} ${esc(c.title || '')}</td><td>${fmtDur(c.ms)}</td><td>${new Date(c.doneAt).toLocaleDateString()}</td></tr>`).join('')}</table>` : '<div class="empty">Aparecerá cuando una historia pase de in-progress a done mientras se mide.</div>'}
+        </div>
+      </div>`;
+    bindCommon(view);
+  }
+
+  // =====================================================================
+  //  3. GitHub: ramas y PRs vinculados a las historias
+  // =====================================================================
+  const projKey = () => state.source?.label || state.source?.path || state.source?.projectId || '';
+  const ghToken = {
+    get() { try { return sessionStorage.getItem('bmad.ghToken') || localStorage.getItem('bmad.ghToken') || ''; } catch { return ''; } },
+    set(t, remember) { try { sessionStorage.removeItem('bmad.ghToken'); localStorage.removeItem('bmad.ghToken'); if (t) (remember ? localStorage : sessionStorage).setItem('bmad.ghToken', t); } catch { /* */ } },
+  };
+  function parseGitRemote(config) {
+    if (!config) return null;
+    const section = /\[remote "origin"\]([\s\S]*?)(?=\n\[|$)/.exec(config)?.[1] ?? config;
+    const m = /url\s*=\s*(?:https?:\/\/(?:[^@/\s]+@)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\s*$/m.exec(section);
+    return m ? `${m[1]}/${m[2]}` : null;
+  }
+  async function detectRepo() {
+    const src = state.source;
+    try {
+      if (src.kind === 'browser' && src.handle) return parseGitRemote(await (await (await (await src.handle.getDirectoryHandle('.git')).getFileHandle('config')).getFile()).text());
+      if (src.kind === 'local') return parseGitRemote((await api('/api/local/git?' + q({ path: src.path }))).config);
+    } catch { /* sin .git */ }
+    return null;
+  }
+  async function ghFetch(path) {
+    const headers = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+    const t = ghToken.get();
+    if (t) headers.Authorization = `Bearer ${t}`;
+    const res = await fetch(`https://api.github.com${path}`, { headers });
+    if (res.ok) return res.json();
+    if (res.status === 401) throw new Error('Token de GitHub inválido o caducado.');
+    if (res.status === 403 && res.headers.get('x-ratelimit-remaining') === '0') throw new Error('Límite de la API de GitHub alcanzado. Añade un token para tener más cupo.');
+    if (res.status === 404) throw new Error('Repositorio no encontrado. Si es privado, añade un token con permiso de lectura.');
+    throw new Error(`GitHub respondió ${res.status}.`);
+  }
+  function storyRefMatch(s, text, isTitle = false) {
+    const l = String(text || '').toLowerCase();
+    if (!l) return false;
+    const [e, n] = s.id.split('.');
+    const slug = (s.key || '').toLowerCase();
+    if (slug && slug.split('-').length > 2 && l.includes(slug)) return true;
+    if (isTitle) return new RegExp(`(\\b(story|historia)\\s*#?\\s*${e}[.-]${n}\\b)|(^\\[?${e}\\.${n}[\\]:\\s])|(\\[${e}\\.${n}\\])`).test(l);
+    if (/^(release|hotfix\/v|v\d)/.test(l)) return false;
+    return new RegExp(`(^|[/_-])(story[-_]?)?${e}[-.]${n}([-_]|$)`).test(l.replace(/^.*\//, '/'));
+  }
+  function matchGitHub() {
+    const gh = state.gh;
+    if (!gh?.prs) return;
+    gh.byStory = {};
+    for (const s of state.data.stories) {
+      const prs = gh.prs.filter((p) => storyRefMatch(s, p.head?.ref) || storyRefMatch(s, p.title, true)).map((p) => ({ number: p.number, title: p.title, url: p.html_url, branch: p.head?.ref, state: p.merged_at ? 'merged' : p.state, updated: p.updated_at }));
+      const branches = gh.branches.filter((b) => storyRefMatch(s, b.name)).map((b) => b.name);
+      if (prs.length || branches.length) gh.byStory[s.id] = { prs, branches };
+    }
+  }
+  async function loadGitHub(force = false) {
+    if (readOnly() || !state.data) return;
+    const saved = store.get('bmad.gh.' + projKey(), {});
+    state.gh = state.gh && state.gh.key === projKey() ? state.gh : { key: projKey(), repo: saved.repo || null, status: 'idle' };
+    const gh = state.gh;
+    if (!gh.repo && !gh.detected) { gh.detected = true; gh.repo = await detectRepo(); if (gh.repo) store.set('bmad.gh.' + projKey(), { repo: gh.repo }); }
+    if (!gh.repo) { gh.status = 'norepo'; return; }
+    if (!force && gh.fetchedAt && Date.now() - gh.fetchedAt < 5 * 60000) { matchGitHub(); return; }
+    gh.status = 'loading';
+    try {
+      const [prs, branches] = await Promise.all([ghFetch(`/repos/${gh.repo}/pulls?state=all&per_page=100&sort=updated&direction=desc`), ghFetch(`/repos/${gh.repo}/branches?per_page=100`)]);
+      Object.assign(gh, { prs, branches, status: 'ok', error: null, fetchedAt: Date.now() });
+      matchGitHub();
+    } catch (err) { Object.assign(gh, { status: 'error', error: err.message }); }
+  }
+  function gitAlerts() {
+    const out = [];
+    const gh = state.gh;
+    if (gh?.status !== 'ok') return out;
+    for (const s of state.data.stories) {
+      const g = gh.byStory?.[s.id];
+      const open = g?.prs.filter((p) => p.state === 'open') || [];
+      const merged = g?.prs.filter((p) => p.state === 'merged') || [];
+      if (s.status === 'done' && open.length) out.push({ level: 'warning', storyId: s.id, message: `${s.id}: está en done pero su PR #${open[0].number} sigue abierto.` });
+      if (['backlog', 'drafted', 'ready-for-dev'].includes(s.status) && open.length) out.push({ level: 'warning', storyId: s.id, message: `${s.id}: hay un PR abierto (#${open[0].number}) pero la historia está en ${s.status}. Muévela a in-progress o review.` });
+      if (merged.length && !open.length && s.status !== 'done') out.push({ level: 'warning', storyId: s.id, message: `${s.id}: el PR #${merged[0].number} ya está fusionado pero la historia sigue en ${s.status}.` });
+      if (s.status === 'done' && !g) out.push({ level: 'info', storyId: s.id, message: `${s.id}: está en done y no se encontró ninguna rama ni PR asociado en ${gh.repo}.` });
+    }
+    return out;
+  }
+
+  // =====================================================================
+  //  4. Resultados de pruebas por historia (JUnit / Surefire / Gradle / TRX)
+  // =====================================================================
+  function isTestReportPath(rel) {
+    const p = rel.toLowerCase();
+    if (p.includes('node_modules/')) return false;
+    if (p.endsWith('.trx')) return true;
+    if (!p.endsWith('.xml')) return false;
+    return /(surefire|failsafe)-reports\/test-[^/]+\.xml$/.test(p) || /build\/test-results\/[^/]+\/[^/]+\.xml$/.test(p) || /(^|\/)(junit|test-results?|testresults)[^/]*\.xml$/.test(p) || /(^|\/)test-results\/[^/]+\.xml$/.test(p);
+  }
+  async function findReportsInHandle(root) {
+    const out = [];
+    const skip = ['node_modules', '.git', '_bmad', '.bmad-core', 'obj', '.gradle', '.idea', '.vs', '.vscode', 'bin'];
+    async function walk(dir, prefix, depth) {
+      if (depth > 7 || out.length >= 400) return;
+      for await (const [name, h] of dir.entries()) {
+        if (h.kind === 'directory') { if (!skip.includes(name)) await walk(h, prefix + name + '/', depth + 1); }
+        else if (isTestReportPath(prefix + name)) out.push({ path: prefix + name, handle: h });
+      }
+    }
+    await walk(root, '', 0);
+    return out;
+  }
+  function parseTestReport(path, xml, mtime) {
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    if (doc.getElementsByTagName('parsererror').length) return [];
+    const out = [];
+    if (path.toLowerCase().endsWith('.trx') || doc.documentElement.localName === 'TestRun') {
+      const defs = new Map();
+      for (const ut of doc.getElementsByTagNameNS('*', 'UnitTest')) defs.set(ut.getAttribute('id'), ut.getElementsByTagNameNS('*', 'TestMethod')[0]?.getAttribute('className') || '');
+      for (const r of doc.getElementsByTagNameNS('*', 'UnitTestResult')) {
+        const o = (r.getAttribute('outcome') || '').toLowerCase();
+        out.push({
+          cls: (defs.get(r.getAttribute('testId')) || '').split(',')[0].trim(), file: '', name: r.getAttribute('testName') || '',
+          status: o === 'passed' ? 'passed' : ['failed', 'error', 'timeout', 'aborted'].includes(o) ? 'failed' : 'skipped',
+          message: (r.getElementsByTagNameNS('*', 'Message')[0]?.textContent || '').trim().split('\n')[0].slice(0, 300),
+          report: path, at: Date.parse(r.getAttribute('endTime') || '') || mtime,
+        });
+      }
+    } else {
+      for (const tc of doc.getElementsByTagName('testcase')) {
+        const suite = tc.parentElement;
+        const fail = tc.getElementsByTagName('failure')[0] || tc.getElementsByTagName('error')[0];
+        out.push({
+          cls: tc.getAttribute('classname') || suite?.getAttribute('name') || '', file: tc.getAttribute('file') || suite?.getAttribute('file') || '', name: tc.getAttribute('name') || '',
+          status: fail ? 'failed' : tc.getElementsByTagName('skipped')[0] ? 'skipped' : 'passed',
+          message: fail ? (fail.getAttribute('message') || fail.textContent || '').trim().split('\n')[0].slice(0, 300) : '',
+          report: path, at: Date.parse(suite?.getAttribute('timestamp') || '') || mtime,
+        });
+      }
+    }
+    return out;
+  }
+  const baseName = (p) => String(p || '').split(/[\\/]/).pop().replace(/\$.*$/, '').replace(/\.(test|spec|tests|it)\.[a-z]+$/i, '').replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+  function mapTestsToStories() {
+    const t = state.tests;
+    t.byStory = {};
+    const all = [...t.reports.values()].flatMap((r) => r.tests);
+    t.total = all.length;
+    t.failed = all.filter((x) => x.status === 'failed').length;
+    t.lastRun = all.reduce((m, x) => Math.max(m, x.at || 0), 0);
+    for (const s of state.data.stories) {
+      const files = state.data.details?.[s.id]?.fileList || [];
+      if (!files.length) continue;
+      const bases = new Set(files.map(baseName).filter((b) => b.length > 2));
+      const match = (x) => {
+        const simple = baseName(x.cls.split('.').pop()) || '';
+        const fileBase = baseName(x.file);
+        for (const b of bases) {
+          if (simple === b || fileBase === b) return true;
+          if (['test', 'tests', 'it', 'spec', 'integrationtest', 'integrationtests'].some((suf) => simple === b + suf)) return true;
+        }
+        return false;
+      };
+      const tests = all.filter(match);
+      if (!tests.length) continue;
+      t.byStory[s.id] = {
+        total: tests.length, passed: tests.filter((x) => x.status === 'passed').length, failed: tests.filter((x) => x.status === 'failed').length,
+        skipped: tests.filter((x) => x.status === 'skipped').length, lastRun: tests.reduce((m, x) => Math.max(m, x.at || 0), 0),
+        failures: tests.filter((x) => x.status === 'failed').slice(0, 10),
+      };
+    }
+  }
+  async function loadTests() {
+    if (readOnly() || !state.data) return;
+    const src = state.source;
+    state.tests = state.tests && state.tests.key === projKey() ? state.tests : { key: projKey(), reports: new Map() };
+    const t = state.tests;
+    try {
+      const seen = new Set();
+      if (src.kind === 'browser' && src.handle) {
+        for (const f of await findReportsInHandle(src.handle)) {
+          const file = await f.handle.getFile();
+          seen.add(f.path);
+          const prev = t.reports.get(f.path);
+          if (prev && prev.mtime === file.lastModified) continue;
+          t.reports.set(f.path, { mtime: file.lastModified, tests: parseTestReport(f.path, await file.text(), file.lastModified) });
+        }
+      } else if (src.kind === 'browser' && src.testFiles) {
+        for (const f of src.testFiles) { seen.add(f.path); if (!t.reports.has(f.path)) t.reports.set(f.path, { mtime: f.file.lastModified, tests: parseTestReport(f.path, await f.file.text(), f.file.lastModified) }); }
+      } else if (src.kind === 'local') {
+        for (const r of await api('/api/local/tests?' + q({ path: src.path }))) { seen.add(r.path); t.reports.set(r.path, { mtime: r.mtime, tests: parseTestReport(r.path, r.content, r.mtime) }); }
+      }
+      for (const k of [...t.reports.keys()]) if (!seen.has(k)) t.reports.delete(k);
+      t.status = 'ok';
+      mapTestsToStories();
+    } catch (err) { t.status = 'error'; t.error = err.message; }
+  }
+  function testAlerts() {
+    const out = [];
+    const t = state.tests;
+    if (t?.status !== 'ok') return out;
+    for (const s of state.data.stories) {
+      const x = t.byStory?.[s.id];
+      if (x?.failed && ['review', 'done'].includes(s.status)) out.push({ level: 'warning', storyId: s.id, message: `${s.id}: está en ${s.status} con ${x.failed} prueba(s) fallando.` });
+      else if (x?.failed) out.push({ level: 'info', storyId: s.id, message: `${s.id}: ${x.failed} prueba(s) fallando (historia en ${s.status}).` });
+    }
+    return out;
+  }
+
+  // ---------------- Integraciones: carga, badges y paneles ----------------
+  async function refreshIntegrations(force = false) {
+    if (readOnly() || !state.data) return;
+    await Promise.all([loadTests(), loadGitHub(force)]);
+    if (['tablero', 'alertas', 'calidad', 'resumen'].includes(currentTab())) render(true);
+    else $('#alert-count').textContent = alertCount(state.data) || '';
+  }
+  function extraAlerts() { return state.data ? [...gitAlerts(), ...testAlerts()] : []; }
+  function alertCount(d) { return d.alerts.filter((a) => a.level !== 'info').length + extraAlerts().filter((a) => a.level !== 'info').length; }
+
+  function integrationBadges(s) {
+    const t = state.tests?.byStory?.[s.id];
+    const g = state.gh?.byStory?.[s.id];
+    let html = '';
+    if (t) html += t.failed ? `<span class="ib fail" title="${t.failed} prueba(s) fallando de ${t.total}">✕ ${t.failed}</span>` : `<span class="ib ok" title="${t.passed} de ${t.total} pruebas pasan">✓ ${t.passed}</span>`;
+    if (g?.prs?.length) {
+      const p = g.prs[0];
+      html += `<span class="ib pr ${p.state}" title="PR #${p.number} (${p.state}): ${esc(p.title)}">${p.state === 'merged' ? '✔' : p.state === 'open' ? '⇡' : '✕'} #${p.number}</span>`;
+    } else if (g?.branches?.length) html += `<span class="ib br" title="Rama: ${esc(g.branches[0])}">⑂</span>`;
+    return html;
+  }
+
+  function storyIntegrationHtml(id) {
+    const t = state.tests?.byStory?.[id];
+    const g = state.gh?.byStory?.[id];
+    const gh = state.gh;
+    let html = '<div class="detail-grid">';
+    html += '<div><h3>GitHub</h3>';
+    if (!gh || gh.status === 'norepo') html += '<div class="muted small-text">Sin repositorio de GitHub configurado (pestaña "Git y pruebas").</div>';
+    else if (gh.status === 'error') html += `<div class="hint err">${esc(gh.error)}</div>`;
+    else if (!g) html += `<div class="muted small-text">No hay ramas ni PRs que mencionen ${esc(id)} en ${esc(gh.repo)}.</div>`;
+    else {
+      html += g.prs.map((p) => `<div class="small-text"><span class="ib pr ${p.state}">${p.state}</span> <a href="${esc(p.url)}" target="_blank" rel="noopener">#${p.number} ${esc(p.title)}</a> <span class="mono muted">${esc(p.branch || '')}</span></div>`).join('');
+      if (g.branches.length) html += `<div class="small-text muted" style="margin-top:4px">Ramas: ${g.branches.map((b) => `<span class="mono">${esc(b)}</span>`).join(', ')}</div>`;
+    }
+    html += '</div><div><h3>Pruebas</h3>';
+    if (!t) html += `<div class="muted small-text">${state.tests?.total ? 'Ninguna prueba coincide con los archivos de la File List de esta historia.' : 'No se encontraron reportes de pruebas (JUnit/Surefire/Gradle/TRX) en el proyecto.'}</div>`;
+    else {
+      html += `<div class="small-text"><b class="${t.failed ? 'fail-text' : 'ok-text'}">${t.failed ? `${t.failed} fallando` : 'Todas pasan'}</b> · ${t.passed}/${t.total} pasan${t.skipped ? ` · ${t.skipped} omitidas` : ''} · ejecutadas ${timeAgo(t.lastRun)}</div>`;
+      if (t.failures.length) html += `<ul class="small-text" style="padding-left:18px;margin:6px 0 0">${t.failures.map((f) => `<li><span class="mono">${esc((f.cls.split('.').pop() || '') + '.' + f.name)}</span>${f.message ? ` — <span class="muted">${esc(f.message)}</span>` : ''}</li>`).join('')}</ul>`;
+    }
+    return html + '</div></div>';
+  }
+
+  // ---------------- Pestaña "Git y pruebas" ----------------
+  async function renderQuality(view, d) {
+    if (readOnly()) { view.innerHTML = '<div class="panel empty">Abre la carpeta del proyecto para ver GitHub y las pruebas.</div>'; return; }
+    const gh = state.gh || {};
+    const t = state.tests || {};
+    const token = ghToken.get();
+    view.innerHTML = `
+      <div class="grid two">
+        <div class="panel">
+          <div class="panel-head"><h2>GitHub</h2><span class="spacer"></span><button class="btn small ghost" id="gh-refresh">⟳ Actualizar</button></div>
+          <form id="gh-form" class="form-grid">
+            <div><label>Repositorio (owner/repo)</label><input type="text" id="gh-repo" value="${esc(gh.repo || '')}" placeholder="usuario/mi-proyecto" /><div class="help">${gh.detected && gh.repo ? 'Detectado desde .git/config' : 'Se detecta desde .git/config si existe'}</div></div>
+            <div><label>Token (opcional, para repos privados)</label><input type="password" id="gh-token" placeholder="${token ? 'Token guardado — escribe para reemplazarlo' : 'github_pat_…'}" autocomplete="off" />
+              <div class="help">Token de solo lectura (Contents y Pull requests: Read). Se guarda solo en este navegador.</div></div>
+            <div class="full actions" style="margin-top:0"><button class="btn primary" type="submit">Guardar y cargar</button>${token ? '<button class="btn ghost" type="button" id="gh-token-clear">Quitar token</button>' : ''}</div>
+          </form>
+          <div class="tip">${gh.status === 'ok' ? `✓ ${gh.prs.length} PRs y ${gh.branches.length} ramas leídos de ${esc(gh.repo)} ${timeAgo(gh.fetchedAt)}.` : gh.status === 'error' ? `<span class="hint err">${esc(gh.error)}</span>` : gh.status === 'loading' ? 'Cargando…' : 'Sin repositorio configurado.'}</div>
+          <p class="tip">Una rama o PR se vincula a una historia si su nombre contiene la clave (<code>1-3-login-con-jwt</code>) o el id (<code>story-1.3</code>, <code>feature/1-3-…</code>), o si el título del PR la menciona (<code>[1.3]</code>, <code>Story 1.3</code>).</p>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Pruebas</h2><span class="spacer"></span><button class="btn small ghost" id="tests-refresh">⟳ Releer reportes</button></div>
+          ${t.status === 'error' ? `<div class="hint err">${esc(t.error)}</div>` : t.reports?.size ? `
+            <div class="grid kpis">${kpi('Pruebas', t.total, `${t.reports.size} reporte(s)`)}${kpi('Fallando', t.failed, t.failed ? 'revisa las historias afectadas' : 'todo en verde')}${kpi('Última ejecución', t.lastRun ? timeAgo(t.lastRun) : '—', '')}</div>
+            <p class="tip">Las pruebas se asocian a una historia comparando las clases de prueba con los archivos de su <i>File List</i> (p. ej. <code>LoginService.java</code> ↔ <code>LoginServiceTest</code>).</p>`
+            : `<div class="empty">No se encontraron reportes. El dashboard lee:<br><code>target/surefire-reports/TEST-*.xml</code> · <code>target/failsafe-reports</code> (Maven) · <code>build/test-results/**/*.xml</code> (Gradle) · <code>*.trx</code> (.NET, <code>dotnet test --logger trx</code>) · <code>junit*.xml</code></div>`}
+        </div>
+      </div>
+      <div class="panel" style="margin-top:16px">
+        <div class="panel-head"><h2>Historias</h2><span class="muted">estado, GitHub y pruebas</span></div>
+        <table class="trend-table q-table"><tr><th>Historia</th><th>Estado</th><th>GitHub</th><th>Pruebas</th></tr>
+        ${d.stories.filter((s) => s.status !== 'backlog').map((s) => {
+          const g = state.gh?.byStory?.[s.id]; const x = state.tests?.byStory?.[s.id];
+          return `<tr data-story="${esc(s.id)}" class="clickable"><td><b>${esc(s.id)}</b> ${esc(s.title)}</td><td>${pill(s.status)}</td>
+            <td>${g?.prs?.length ? g.prs.map((p) => `<span class="ib pr ${p.state}">#${p.number} ${p.state}</span>`).join(' ') : g?.branches?.length ? `<span class="mono small-text">${esc(g.branches[0])}</span>` : '<span class="muted">—</span>'}</td>
+            <td>${x ? (x.failed ? `<span class="ib fail">✕ ${x.failed} de ${x.total}</span>` : `<span class="ib ok">✓ ${x.passed}/${x.total}</span>`) : '<span class="muted">—</span>'}</td></tr>`;
+        }).join('')}</table>
+      </div>`;
+    bindCommon(view);
+    $('#gh-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const repo = $('#gh-repo').value.trim().replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '');
+      if (repo && !/^[\w.-]+\/[\w.-]+$/.test(repo)) return toast('El repositorio debe tener el formato owner/repo', true);
+      const tok = $('#gh-token').value.trim();
+      if (tok) ghToken.set(tok, true);
+      store.set('bmad.gh.' + projKey(), { repo });
+      state.gh = { key: projKey(), repo: repo || null, status: 'idle', detected: true };
+      await loadGitHub(true);
+      renderQuality(view, d);
+      if (state.gh.status === 'ok') toast('GitHub conectado');
+    });
+    $('#gh-token-clear')?.addEventListener('click', () => { ghToken.set(''); toast('Token eliminado'); renderQuality(view, d); });
+    $('#gh-refresh').addEventListener('click', async () => { await loadGitHub(true); renderQuality(view, d); });
+    $('#tests-refresh').addEventListener('click', async () => { await loadTests(); renderQuality(view, d); toast('Reportes de pruebas releídos'); });
   }
 
   // ---------------- Arranque ----------------
