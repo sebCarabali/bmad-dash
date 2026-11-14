@@ -154,6 +154,16 @@ export interface DashboardData {
   config: Record<string, string>;
   details: Record<string, ParsedStory>;
   specContext: SpecContext;
+  planningDocs: PlanningDoc[];
+}
+
+/** Documento de planificación disponible como contexto para el asistente. */
+export interface PlanningDoc {
+  path: string;
+  kind: 'prd' | 'architecture' | 'ux' | 'epics' | 'brief' | 'context' | 'always';
+  mtime: number;
+  size: number;
+  shard: boolean;
 }
 
 /** Datos mínimos que necesita el generador de especificaciones. */

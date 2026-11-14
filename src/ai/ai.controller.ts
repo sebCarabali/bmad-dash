@@ -1,7 +1,7 @@
 import { BadRequestException, Body, Controller, Headers, HttpCode, Post, Res, UnauthorizedException } from '@nestjs/common';
 import type { Response } from 'express';
 import Anthropic from '@anthropic-ai/sdk';
-import { AiContext, AiTask, baseInstructions, BUDGETS, QUICK_TASK_MAX_TOKENS, projectContext, taskInstructions } from './ai.prompts';
+import { AiContext, AiTask, baseInstructions, BUDGETS, QUICK_TASK_MAX_TOKENS, sectionsBlock, sprintStateBlock, stableDocsBlock, taskInstructions } from './ai.prompts';
 import { GroqError, groqModels, groqStream } from './groq.client';
 
 type Provider = 'groq' | 'claude';
@@ -65,13 +65,20 @@ export class AiController {
     if (!messages.length || messages[messages.length - 1].role !== 'user') throw new BadRequestException('Falta el mensaje del usuario.');
 
     const key = this.key(aiKey || legacyKey, provider);
-    let context = projectContext(ctx, budget);
+    // Orden pensado para la caché de prompts: lo estable primero, lo que cambia en cada consulta al final.
+    const base = baseInstructions(ctx);
+    let stable = stableDocsBlock(ctx, budget);
+    let sprint = sprintStateBlock(ctx, budget);
+    let sections = sectionsBlock(ctx, budget);
     const extra = taskInstructions(task, ctx, budget);
     // Groq gratis: ~8K tokens por minuto entre entrada y salida. Tope de ~5K tokens para el contexto.
     if (provider === 'groq') {
       const MAX = 20_000;
-      if (context.length + extra.length > MAX && ctx.docs?.length) context = projectContext({ ...ctx, docs: [] }, budget) + '\n\n(Documentos de planificación omitidos para no superar el límite del plan gratuito.)';
-      if (context.length + extra.length > MAX) context = context.slice(0, Math.max(4_000, MAX - extra.length)) + '\n…[contexto recortado]';
+      const total = () => base.length + stable.length + sprint.length + sections.length + extra.length;
+      let n = ctx.sections?.length ?? 0;
+      while (total() > MAX && n > 0) sections = sectionsBlock({ ...ctx, sections: ctx.sections.slice(0, --n) }, budget);
+      if (total() > MAX) stable = stable.slice(0, Math.max(0, MAX - (total() - stable.length))) ;
+      if (total() > MAX) sprint = sprint.slice(0, Math.max(3_000, MAX - (total() - sprint.length))) + '\n…[estado recortado]';
     }
 
     res.status(200);
@@ -92,7 +99,7 @@ export class AiController {
         const r = await groqStream({
           key,
           model: body?.model || 'openai/gpt-oss-120b',
-          system: [baseInstructions(ctx), context, extra].filter(Boolean).join('\n\n'),
+          system: [base, stable, sprint, sections, extra].filter(Boolean).join('\n\n'),
           messages,
           maxTokens: GROQ_MAX_TOKENS[task],
           onText: (t) => !closed && send({ type: 'text', text: t }),
@@ -101,12 +108,13 @@ export class AiController {
         send({ type: 'done', provider, model: r.model, stopReason: r.stopReason, usage: r.usage });
       } else {
         const client = new Anthropic({ apiKey: key, maxRetries: 1, timeout: 55_000 });
-        const system: Anthropic.TextBlockParam[] = [
-          { type: 'text', text: baseInstructions(ctx) },
-          // Bloque grande y estable: se cachea entre turnos del chat (prompt caching)
-          { type: 'text', text: context, cache_control: { type: 'ephemeral' } },
-        ];
-        if (extra) system.push({ type: 'text', text: extra });
+        // Puntos de caché: tras el contexto permanente y tras el estado del sprint.
+        // Las secciones y la tarea (cambian en cada consulta) van después, sin caché.
+        const system: Anthropic.TextBlockParam[] = [{ type: 'text', text: base }];
+        if (stable) system.push({ type: 'text', text: stable, cache_control: { type: 'ephemeral' } });
+        system.push({ type: 'text', text: sprint, cache_control: { type: 'ephemeral' } });
+        const tail = [sections, extra].filter(Boolean).join('\n\n');
+        if (tail) system.push({ type: 'text', text: tail });
         const model = CLAUDE_MODELS.includes(body?.model ?? '') ? body.model : CLAUDE_MODELS[0];
         const stream = client.messages.stream({ model, max_tokens: QUICK_TASK_MAX_TOKENS[task], system, messages }, { signal: abort.signal });
         stream.on('text', (delta) => !closed && send({ type: 'text', text: delta }));

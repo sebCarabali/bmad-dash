@@ -32,7 +32,7 @@
     history: null,
     lastSync: null,
     busy: false,
-    ai: { convo: [], focus: null, prefill: '', model: null, includeDocs: true, streaming: null },
+    ai: { convo: [], focus: null, prefill: '', streaming: null, index: null },
   };
 
   const $ = (sel, el = document) => el.querySelector(sel);
@@ -1253,7 +1253,8 @@
       status.classList.remove('hidden');
       status.textContent = 'Leyendo la épica, el PRD y la arquitectura…';
       try {
-        const context = await buildAiContext({ includeDocs: state.source.kind !== 'cloud', specDraft });
+        const { ctx: context, sources } = await buildAiContext({ task: 'draft-story', specDraft });
+        status.textContent = sources.length ? `Usando: ${sources.join(' · ')}` : 'Redactando…';
         const r = await aiStream({ task: 'draft-story', context, onText: (full) => { status.textContent = `Redactando… ${full.length} caracteres`; } });
         const out = extractJson(r.text);
         if (out.title) F('title').value = out.title;
@@ -1264,7 +1265,7 @@
         if (out.tasks) F('tasks').value = Array.isArray(out.tasks) ? out.tasks.join('\n') : out.tasks;
         if (out.devNotes) F('devNotes').value = out.devNotes;
         if (Array.isArray(out.references)) F('references').value = out.references.join('\n');
-        status.textContent = `✓ Borrador generado con IA. Revísalo antes de guardar. ${usageLine(r.usage)}`;
+        status.innerHTML = `✓ Borrador generado con IA. Revísalo antes de guardar. ${esc(usageLine(r.usage))}${sourcesHtml(sources)}`;
         schedule();
       } catch (err) {
         status.innerHTML = `<span class="hint err">${esc(err instanceof SyntaxError ? 'La IA no devolvió un JSON válido. Inténtalo de nuevo o prueba otro modelo.' : err.message)}</span>`;
@@ -1278,9 +1279,9 @@
       box.classList.remove('hidden');
       box.innerHTML = '<p class="muted">Revisando la historia…</p>';
       try {
-        const context = await buildAiContext({ includeDocs: state.source.kind !== 'cloud', specMarkdown: lastPreview.markdown });
+        const { ctx: context, sources } = await buildAiContext({ task: 'review-story', specMarkdown: lastPreview.markdown });
         const r = await aiStream({ task: 'review-story', context, onText: (full) => { box.innerHTML = renderMd(full); } });
-        box.innerHTML = renderMd(r.text) + `<p class="muted small-text">${usageLine(r.usage)}</p>`;
+        box.innerHTML = renderMd(r.text) + `<p class="muted small-text">${esc(usageLine(r.usage))}</p>${sourcesHtml(sources)}`;
       } catch (err) { box.innerHTML = `<p class="hint err">${esc(err.message)}</p>`; }
       finally { btn.disabled = false; }
     });
@@ -1489,21 +1490,139 @@
     return null;
   }
 
-  /** Documentos de planificación para el contexto: PRD, arquitectura, UX, brief y épicas. */
-  async function planningDocs() {
-    const d = state.data;
-    const wanted = ['prd', 'architecture', 'ux', 'brief', 'epics', 'context'];
-    const out = [];
-    for (const type of wanted) {
-      const a = d.artifacts.find((x) => x.type === type);
-      if (!a || !/\.md$/i.test(a.relativePath)) continue;
-      const content = await readProjectFile(a.relativePath);
-      if (content) out.push({ path: a.relativePath, content });
-    }
-    return out;
+  // ---------------- Contexto de documentación: búsqueda de secciones relevantes (BM25) ----------------
+  const STOPWORDS = new Set(('de la que el en y a los del se las por un para con no una su al lo como mas pero sus le ya o este si porque esta entre cuando muy sin sobre tambien me hasta hay donde quien desde todo nos durante todos uno les ni contra otros ese eso ante ellos e esto mi antes algunos unos yo otro otras otra el tanto esa estos mucho quienes nada muchos cual poco ella estar estas algunas algo nosotros mis tu te ti tus ellas cada debe deben debo puede pueden hace hacer hacerlo como que cual cuales segun ser son fue era sera estan esta estoy tiene tienen tener the and or of to in for on with is are be by as at from that this it its into should must can will how what which when where who why does do story stories historia historias proyecto sistema usuario dashboard bmad sobre explica explicame dime quiero necesito ahora luego despues favor hola gracias'.split(' ')));
+  const BUDGET_DOCS = { groq: { chars: 7000, max: 5, always: 4000 }, claude: { chars: 36000, max: 14, always: 20000 } };
+
+  function tokenize(text) {
+    return (text || '')
+      .normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((t) => t.length >= 3 && !STOPWORDS.has(t))
+      .map((t) => (t.length > 5 && t.endsWith('es') ? t.slice(0, -2) : t.length > 4 && t.endsWith('s') ? t.slice(0, -1) : t));
   }
 
-  async function buildAiContext({ includeDocs = false, focusId = null, specDraft = null, specMarkdown = null } = {}) {
+  /** Divide un markdown en secciones por encabezados (#, ##, ###), con el título del padre para dar contexto. */
+  function splitDocSections(path, md) {
+    const out = [];
+    const lines = md.replace(/\r\n/g, '\n').split('\n');
+    let h2 = '', cur = { heading: 'Introducción', lines: [] }, inCode = false;
+    const push = () => {
+      const text = cur.lines.join('\n').trim();
+      if (text.replace(/^#+.*$/gm, '').trim().length < 40) return;
+      if (text.length <= 3000) out.push({ heading: cur.heading, text });
+      else {
+        // Secciones muy largas: trozos de ~2.000 caracteres por párrafos
+        let chunk = '', part = 1;
+        for (const para of text.split(/\n{2,}/)) {
+          if (chunk && chunk.length + para.length > 2000) { out.push({ heading: `${cur.heading} (parte ${part++})`, text: chunk.trim() }); chunk = ''; }
+          chunk += para + '\n\n';
+        }
+        if (chunk.trim()) out.push({ heading: part > 1 ? `${cur.heading} (parte ${part})` : cur.heading, text: chunk.trim() });
+      }
+    };
+    for (const line of lines) {
+      if (/^\s*```/.test(line)) inCode = !inCode;
+      const m = !inCode && /^(#{1,3})\s+(.+?)\s*#*\s*$/.exec(line);
+      if (m) {
+        push();
+        const title = m[2].replace(/[*_`]/g, '');
+        if (m[1].length === 1) { h2 = ''; cur = { heading: title, lines: [line] }; }
+        else if (m[1].length === 2) { h2 = title; cur = { heading: title, lines: [line] }; }
+        else cur = { heading: h2 ? `${h2} › ${title}` : title, lines: [line] };
+      } else cur.lines.push(line);
+    }
+    push();
+    const file = path.split('/').pop();
+    return out.map((s) => ({ ...s, path, source: `${file}#${s.heading}` }));
+  }
+
+  /** Índice BM25 de las secciones de PRD/arquitectura/UX/épicas (se reconstruye solo si cambian los documentos). */
+  async function docIndex() {
+    const docs = state.data.planningDocs || [];
+    const key = docs.map((d) => `${d.path}|${d.mtime}|${d.size}`).join(';');
+    if (state.ai.index?.key === key) return state.ai.index;
+    const always = [];
+    const sections = [];
+    for (const d of docs) {
+      const content = await readProjectFile(d.path);
+      if (!content) continue;
+      if (d.kind === 'context' || d.kind === 'always') always.push({ path: d.path, content });
+      else for (const s of splitDocSections(d.path, content)) sections.push({ ...s, kind: d.kind });
+    }
+    const df = new Map();
+    let totalLen = 0;
+    for (const s of sections) {
+      const toks = [...tokenize(s.heading), ...tokenize(s.heading), ...tokenize(s.text)]; // el título cuenta doble
+      s.tf = new Map();
+      for (const t of toks) s.tf.set(t, (s.tf.get(t) || 0) + 1);
+      s.len = toks.length;
+      totalLen += s.len;
+      for (const t of s.tf.keys()) df.set(t, (df.get(t) || 0) + 1);
+    }
+    state.ai.index = { key, always, sections, df, avgLen: sections.length ? totalLen / sections.length : 1 };
+    return state.ai.index;
+  }
+
+  function bm25(index, query) {
+    const q = [...new Set(tokenize(query))];
+    const N = index.sections.length;
+    return index.sections.map((s) => {
+      let score = 0;
+      for (const t of q) {
+        const f = s.tf.get(t);
+        if (!f) continue;
+        const n = index.df.get(t) || 0;
+        const idf = Math.log(1 + (N - n + 0.5) / (n + 0.5));
+        score += idf * ((f * 2.2) / (f + 1.2 * (1 - 0.75 + (0.75 * s.len) / index.avgLen)));
+      }
+      return { s, score };
+    });
+  }
+
+  /**
+   * Elige qué documentación enviar. mode: 'auto' | 'always' | 'never'.
+   * En 'auto' una pregunta general no lleva documentos; una pregunta técnica, una historia o una redacción sí.
+   */
+  async function selectDocContext({ task, query, mode }) {
+    if (mode === 'never' || state.source.kind === 'cloud') return { alwaysDocs: [], sections: [], sources: [] };
+    const index = await docIndex();
+    const budget = BUDGET_DOCS[aiProvider()];
+    // Al redactar o revisar, la historia y su épica ya van en el formulario: epics.md solo añadiría ruido
+    const isStoryTask = task !== 'chat';
+    const scored = bm25(index, query)
+      .filter((x) => x.score > 0 && !(isStoryTask && x.s.kind === 'epics'))
+      .sort((a, b) => b.score - a.score);
+    const top = scored[0]?.score || 0;
+    const needsDocs = mode === 'always' || isStoryTask || top >= 2.5;
+    const picked = [];
+    let used = 0;
+    const take = (s) => {
+      if (picked.includes(s) || picked.length >= budget.max) return;
+      if (used + s.text.length > budget.chars && picked.length) return;
+      picked.push(s);
+      used += s.text.length;
+    };
+    if (needsDocs) {
+      // Para historias: la mejor sección de cada documento (PRD, arquitectura, UX) aunque puntúe menos
+      if (isStoryTask) for (const kind of ['architecture', 'prd', 'ux']) { const best = scored.find((x) => x.s.kind === kind); if (best) take(best.s); }
+      const minRel = mode === 'always' ? 0 : isStoryTask ? 0.2 : 0.3;
+      for (const { s, score } of scored) {
+        if (score < top * minRel) break;
+        take(s);
+      }
+    }
+    const alwaysDocs = index.always;
+    return {
+      alwaysDocs,
+      sections: picked.map((s) => ({ source: s.source, content: s.text })),
+      sources: [...alwaysDocs.map((d) => d.path.split('/').pop()), ...picked.map((s) => s.source)],
+    };
+  }
+
+  const docsMode = () => store.get('bmad.aiDocsMode', 'auto');
+
+  async function buildAiContext({ task = 'chat', query = '', focusId = null, specDraft = null, specMarkdown = null } = {}) {
     const d = state.data;
     const ctx = {
       project: {
@@ -1516,17 +1635,25 @@
       suggestions: d.suggestions.map((s) => ({ priority: s.priority, title: s.title, steps: s.steps, reason: s.reason })),
       alerts: d.alerts.filter((a) => a.level !== 'info').map((a) => a.message),
     };
-    if (includeDocs) ctx.docs = await planningDocs();
+    let q = query;
     if (focusId) {
       const p = d.details?.[focusId];
       const md = p ? await readProjectFile(p.relativePath) : null;
       const planned = d.specContext?.plannedEpics.flatMap((e) => e.plannedStories).find((x) => x.id === focusId);
       const text = md || (planned ? `### Story ${planned.id}: ${planned.title}\n\n${planned.body}` : null);
-      if (text) ctx.focusStory = { id: focusId, markdown: text };
+      if (text) { ctx.focusStory = { id: focusId, markdown: text }; q += '\n' + text.slice(0, 1500); }
+      const epic = d.epics.find((e) => String(e.number) === focusId.split('.')[0]);
+      if (epic) q += '\n' + epic.title;
     }
-    if (specDraft) ctx.specDraft = specDraft;
-    if (specMarkdown) ctx.specMarkdown = specMarkdown;
-    return ctx;
+    if (specDraft) {
+      ctx.specDraft = specDraft;
+      q += '\n' + [specDraft.title, specDraft.want, specDraft.benefit, specDraft.acceptanceCriteria, specDraft.epicTitle, specDraft.plannedStory?.title, specDraft.plannedStory?.body].filter(Boolean).join('\n');
+    }
+    if (specMarkdown) { ctx.specMarkdown = specMarkdown; q += '\n' + specMarkdown.slice(0, 3000); }
+    const docs = await selectDocContext({ task, query: q, mode: docsMode() });
+    ctx.alwaysDocs = docs.alwaysDocs;
+    ctx.sections = docs.sections;
+    return { ctx, sources: docs.sources };
   }
 
   /** Llama a /api/ai/chat y procesa el stream NDJSON. */
@@ -1570,6 +1697,7 @@
     const raw = fenced ? fenced[1] : text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1);
     return JSON.parse(raw);
   }
+  const sourcesHtml = (src) => (src?.length ? `<details class="ai-sources"><summary>📎 Contexto: ${src.length} fuente(s)</summary><ul>${src.map((x) => `<li class="mono">${esc(x)}</li>`).join('')}</ul></details>` : '<span class="ai-sources muted">📎 Sin documentos (solo estado del sprint)</span>');
   const usageLine = (u) => (u ? `${aiProvider() === 'groq' ? 'Groq' : 'Claude'} · ${u.input + u.cacheRead + u.cacheWrite} tokens de entrada${u.cacheRead ? ` (${u.cacheRead} desde caché)` : ''} · ${u.output} de salida` : '');
 
   function providerSelectHtml(id = 'ai-provider') {
@@ -1640,7 +1768,8 @@
           <h2>✨ Asistente</h2>
           ${providerSelectHtml()}
           <select id="ai-model">${aiModels(prov).map((v) => `<option value="${esc(v)}" ${v === model ? 'selected' : ''}>${esc(MODEL_LABELS[v] || v)}</option>`).join('')}</select>
-          ${canDocs ? `<label class="toggle" title="${prov === 'groq' ? 'En Groq gratis se envía un extracto corto de cada documento para no superar el límite de tokens por minuto' : 'Envía PRD, arquitectura, UX y épicas como contexto (más preciso, más tokens)'}"><input type="checkbox" id="ai-docs" ${ai.includeDocs ? 'checked' : ''}/> Incluir PRD y arquitectura${prov === 'groq' ? ' (extracto)' : ''}</label>` : '<span class="muted small-text">Vista guardada: sin documentos de planificación</span>'}
+          ${canDocs ? `<label class="field-inline small-text" title="Auto: solo envía las secciones de PRD/arquitectura/UX relevantes para cada pregunta (las preguntas generales no llevan documentos). Siempre: envía las secciones más relevantes aunque la pregunta sea general. Nunca: solo el estado del sprint.">Docs
+            <select id="ai-docs-mode">${[['auto', 'Auto (secciones relevantes)'], ['always', 'Siempre'], ['never', 'Nunca']].map(([v, l]) => `<option value="${v}" ${docsMode() === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>` : '<span class="muted small-text">Vista guardada: sin documentos de planificación</span>'}
           <span class="spacer"></span>
           <span class="muted small-text" title="${d.config?.communication_language ? 'communication_language en ' + esc(d.config._file || 'la configuración BMAD') : 'El proyecto no define communication_language'}">🌐 ${d.config?.communication_language ? esc(d.config.communication_language) + ' (BMAD)' : 'Idioma del usuario'}</span>
           <button class="btn small ghost" id="ai-new">Nueva conversación</button>
@@ -1667,7 +1796,7 @@
     const drawMessages = () => {
       list.innerHTML = ai.convo.map((m, i) => m.role === 'user'
         ? `<div class="msg user"><div class="bubble">${esc(m.content).replace(/\n/g, '<br>')}</div></div>`
-        : `<div class="msg assistant"><div class="bubble md">${renderMd(m.content || '…')}</div>${m.content ? `<div class="msg-actions"><button class="btn small ghost" data-copymsg="${i}">Copiar</button></div>` : ''}</div>`).join('');
+        : `<div class="msg assistant"><div class="bubble md">${renderMd(m.content || '…')}</div>${m.content ? `<div class="msg-actions"><button class="btn small ghost" data-copymsg="${i}">Copiar</button>${sourcesHtml(m.sources)}</div>` : ''}</div>`).join('');
       list.querySelectorAll('[data-copymsg]').forEach((b) => b.addEventListener('click', () => copy(ai.convo[Number(b.dataset.copymsg)].content)));
       const chat = $('#ai-chat'); chat.scrollTop = chat.scrollHeight;
     };
@@ -1690,7 +1819,9 @@
       $('#ai-send').classList.add('hidden'); $('#ai-stop').classList.remove('hidden');
       $('#ai-usage').textContent = 'Pensando…';
       try {
-        const context = await buildAiContext({ includeDocs: canDocs && ai.includeDocs, focusId: ai.focus });
+        const prevUser = ai.convo.filter((m) => m.role === 'user').slice(-2, -1)[0]?.content || '';
+        const { ctx: context, sources } = await buildAiContext({ task: 'chat', query: `${content}\n${prevUser}`, focusId: ai.focus });
+        reply.sources = sources;
         const history = ai.convo.slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
         let last = 0;
         const r = await aiStream({
@@ -1723,7 +1854,7 @@
     view.querySelectorAll('[data-quick]').forEach((b) => b.addEventListener('click', () => send(b.dataset.quick)));
     $('#ai-model').addEventListener('change', (e) => store.set('bmad.aiModel.' + aiProvider(), e.target.value));
     $('#ai-provider').addEventListener('change', (e) => { store.set('bmad.aiProvider', e.target.value); renderAssistant(view, d); });
-    $('#ai-docs')?.addEventListener('change', (e) => { ai.includeDocs = e.target.checked; });
+    $('#ai-docs-mode')?.addEventListener('change', (e) => store.set('bmad.aiDocsMode', e.target.value));
     $('#ai-new').addEventListener('click', () => { ai.streaming?.abort(); ai.convo = []; ai.focus = null; renderAssistant(view, d); });
     $('#ai-unfocus')?.addEventListener('click', () => { ai.focus = null; renderAssistant(view, d); });
     $('#ai-key-clear').addEventListener('click', () => { aiKey.clear(); toast('API key eliminada de este navegador'); renderAssistant(view, d); });

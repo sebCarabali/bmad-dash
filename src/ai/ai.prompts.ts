@@ -7,7 +7,12 @@ export interface AiContext {
   suggestions?: { priority: string; title: string; steps: string[]; reason?: string }[];
   alerts?: string[];
   focusStory?: { id: string; markdown: string };
+  /** (compatibilidad) documentos completos */
   docs?: { path: string; content: string }[];
+  /** Contexto permanente: project-context.md y devLoadAlwaysFiles */
+  alwaysDocs?: { path: string; content: string }[];
+  /** Secciones de PRD/arquitectura/UX elegidas para esta consulta */
+  sections?: { source: string; content: string }[];
   specDraft?: Record<string, unknown>;
   specMarkdown?: string;
 }
@@ -18,6 +23,9 @@ export type AiTask = 'chat' | 'draft-story' | 'review-story';
 export interface ContextBudget {
   docChars: number;
   maxDocs: number;
+  alwaysChars: number;
+  sectionsChars: number;
+  maxSections: number;
   storyChars: number;
   maxStories: number;
   epicDescChars: number;
@@ -25,8 +33,8 @@ export interface ContextBudget {
   maxAlerts: number;
 }
 export const BUDGETS: Record<'claude' | 'groq', ContextBudget> = {
-  claude: { docChars: 60_000, maxDocs: 6, storyChars: 40_000, maxStories: 400, epicDescChars: 300, maxSuggestions: 15, maxAlerts: 40 },
-  groq: { docChars: 3_500, maxDocs: 3, storyChars: 6_000, maxStories: 120, epicDescChars: 120, maxSuggestions: 6, maxAlerts: 12 },
+  claude: { docChars: 60_000, maxDocs: 6, alwaysChars: 20_000, sectionsChars: 36_000, maxSections: 14, storyChars: 40_000, maxStories: 150, epicDescChars: 300, maxSuggestions: 12, maxAlerts: 30 },
+  groq: { docChars: 3_500, maxDocs: 3, alwaysChars: 4_000, sectionsChars: 7_000, maxSections: 5, storyChars: 6_000, maxStories: 40, epicDescChars: 120, maxSuggestions: 6, maxAlerts: 10 },
 };
 
 /** Idioma configurado en BMAD (communication_language / document_output_language), saneado. */
@@ -63,26 +71,64 @@ function trunc(s: string, max: number) {
   return s.length > max ? `${s.slice(0, max)}\n…[recortado: ${s.length - max} caracteres más]` : s;
 }
 
-/** Contexto estable del proyecto (se cachea con prompt caching entre turnos del chat). */
-export function projectContext(ctx: AiContext, b: ContextBudget = BUDGETS.claude): string {
+/**
+ * Bloque 1 (casi nunca cambia): contexto permanente del proyecto.
+ * Va justo después de las instrucciones para aprovechar la caché de prompts.
+ */
+export function stableDocsBlock(ctx: AiContext, b: ContextBudget = BUDGETS.claude): string {
+  const docs = ctx.alwaysDocs ?? [];
+  if (!docs.length) return '';
+  const lines = ['# Contexto permanente del proyecto (project-context / archivos siempre cargados)'];
+  let left = b.alwaysChars;
+  for (const d of docs) {
+    if (left <= 200) break;
+    const text = trunc(d.content, Math.min(left, b.alwaysChars));
+    left -= text.length;
+    lines.push(`<documento ruta="${d.path}">\n${text}\n</documento>`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Bloque 2 (cambia cuando cambia el sprint): estado del proyecto.
+ * Las historias terminadas se resumen por épica para ahorrar tokens.
+ */
+export function sprintStateBlock(ctx: AiContext, b: ContextBudget = BUDGETS.claude): string {
   const p = ctx.project ?? {};
   const lines: string[] = [];
   lines.push(`# Proyecto: ${p.name ?? 'sin nombre'} (${p.version ?? 'BMAD'})`);
   if (p.storiesDir) lines.push(`Carpeta de historias: ${p.storiesDir}`);
   if (p.sprintStatusFile) lines.push(`sprint-status: ${p.sprintStatusFile}`);
-  if (ctx.stats) lines.push(`Estadísticas: ${JSON.stringify(ctx.stats)}`);
-
+  if (ctx.stats) {
+    const st: any = ctx.stats;
+    const by = st.byStatus ? Object.entries(st.byStatus).map(([k, v]) => `${k}=${v}`).join(', ') : '';
+    lines.push(`Historias: ${st.totalStories ?? '?'} (${by}) · ${st.donePercent ?? 0}% hecho · tareas ${st.tasksDone ?? 0}/${st.tasksTotal ?? 0}`);
+  }
   if (ctx.epics?.length) {
     lines.push('\n## Épicas');
     for (const e of ctx.epics.slice(0, 60))
-      lines.push(`- Épica ${e.number}: ${e.title} — ${e.status}, ${e.progress}% hecho${e.description ? ` — ${trunc(e.description.replace(/\s+/g, ' '), b.epicDescChars)}` : ''}`);
+      lines.push(`- Épica ${e.number}: ${e.title} — ${e.status}, ${e.progress}%${e.description ? ` — ${trunc(e.description.replace(/\s+/g, ' '), b.epicDescChars)}` : ''}`);
   }
   if (ctx.stories?.length) {
-    lines.push('\n## Historias (id · título · estado · tareas)');
-    for (const s of ctx.stories.slice(0, b.maxStories)) {
-      const tasks = s.tasksTotal ? ` · tareas ${s.tasksDone}/${s.tasksTotal}` : '';
-      const warn = s.warnings?.length ? ` · ⚠ ${s.warnings.join('; ')}` : '';
-      lines.push(`- ${s.id} · ${s.title} · ${s.status}${tasks}${s.relativePath ? ` · ${s.relativePath}` : ''}${warn}`);
+    const pending = ctx.stories.filter((s) => s.status !== 'done');
+    const done = ctx.stories.filter((s) => s.status === 'done');
+    if (pending.length) {
+      lines.push('\n## Historias pendientes (id · título · estado · tareas)');
+      for (const s of pending.slice(0, b.maxStories)) {
+        const tasks = s.tasksTotal ? ` · ${s.tasksDone}/${s.tasksTotal}` : '';
+        const path = s.relativePath && s.status !== 'backlog' ? ` · ${s.relativePath}` : '';
+        const warn = s.warnings?.length ? ` · ⚠ ${s.warnings.join('; ')}` : '';
+        lines.push(`- ${s.id} · ${s.title} · ${s.status}${tasks}${path}${warn}`);
+      }
+      if (pending.length > b.maxStories) lines.push(`- … y ${pending.length - b.maxStories} historias más en backlog`);
+    }
+    if (done.length) {
+      const byEpic = new Map<string, string[]>();
+      for (const s of done) {
+        const e = s.id.split('.')[0];
+        byEpic.set(e, [...(byEpic.get(e) ?? []), s.id]);
+      }
+      lines.push(`\n## Historias terminadas (${done.length}): ${[...byEpic.entries()].map(([e, ids]) => `Épica ${e}: ${ids.join(', ')}`).join(' · ')}`);
     }
   }
   if (ctx.suggestions?.length) {
@@ -93,10 +139,32 @@ export function projectContext(ctx: AiContext, b: ContextBudget = BUDGETS.claude
     lines.push('\n## Alertas');
     for (const a of ctx.alerts.slice(0, b.maxAlerts)) lines.push(`- ${a}`);
   }
-  for (const d of (ctx.docs ?? []).slice(0, b.maxDocs)) {
-    lines.push(`\n## Documento: ${d.path}\n<documento ruta="${d.path}">\n${trunc(d.content, b.docChars)}\n</documento>`);
+  return lines.join('\n');
+}
+
+/** Bloque 3 (cambia en cada consulta): secciones de la documentación relevantes para la pregunta. */
+export function sectionsBlock(ctx: AiContext, b: ContextBudget = BUDGETS.claude): string {
+  const sections = ctx.sections?.length
+    ? ctx.sections
+    : (ctx.docs ?? []).slice(0, b.maxDocs).map((d) => ({ source: d.path, content: trunc(d.content, b.docChars) }));
+  if (!sections.length) return '';
+  const lines = [
+    '# Fragmentos de la documentación de planificación (seleccionados para esta consulta)',
+    'Son extractos, no los documentos completos. Si necesitas algo que no aparece aquí, dilo. Cita la fuente como [archivo#sección] cuando uses un fragmento.',
+  ];
+  let left = b.sectionsChars;
+  for (const s of sections.slice(0, b.maxSections)) {
+    if (left <= 300) break;
+    const text = trunc(s.content, left);
+    left -= text.length;
+    lines.push(`\n### [${s.source}]\n${text}`);
   }
   return lines.join('\n');
+}
+
+/** (compatibilidad) contexto completo en un solo bloque */
+export function projectContext(ctx: AiContext, b: ContextBudget = BUDGETS.claude): string {
+  return [stableDocsBlock(ctx, b), sprintStateBlock(ctx, b), sectionsBlock(ctx, b)].filter(Boolean).join('\n\n');
 }
 
 /** Instrucciones del turno según la tarea (van después del bloque cacheado). */

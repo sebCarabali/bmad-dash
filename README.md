@@ -39,6 +39,12 @@ y el servidor la reenvía al proveedor en cada petición sin almacenarla ni regi
 - **Chat sobre el proyecto**: conoce épicas, historias, alertas y comandos sugeridos (en el formato elegido); opcionalmente PRD, arquitectura, UX y épicas.
 - **Preguntar sobre una historia** desde su detalle, con su markdown en contexto.
 - **✨ Redactar con IA** y **✨ Revisar con IA** en Nueva historia.
+- **Contexto eficiente en tokens**: en lugar de enviar el PRD y la arquitectura completos en cada mensaje, el navegador divide los documentos
+  por encabezados y elige con BM25 solo las secciones relevantes para la pregunta, la historia en foco o la historia que se redacta
+  (modo **Auto**; también **Siempre** y **Nunca**). Las preguntas generales no llevan documentos. Usa los fragmentos de `shard-doc`
+  si existen, y envía siempre `project-context.md` y `devLoadAlwaysFiles`. Cada respuesta muestra qué fuentes se usaron.
+  El prompt va ordenado de lo estable a lo variable (instrucciones → contexto permanente → estado del sprint → fragmentos) para aprovechar
+  la caché de prompts, y las historias terminadas se resumen por épica.
 - **Idioma desde BMAD**: las respuestas usan `communication_language` y las historias redactadas `document_output_language`
   (de `_bmad/core/config.yaml` y `_bmad/bmm/config.yaml`; el de bmm prevalece). Sin configuración, responde en el idioma del usuario.
 - Errores claros: key inválida, sin créditos (Claude), límite por minuto/día o petición demasiado grande (Groq).

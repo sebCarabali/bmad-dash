@@ -12,6 +12,7 @@ import {
   PlannedEpic,
   RetroStatus,
   SpecContext,
+  PlanningDoc,
   SprintStatusData,
   StoryView,
   VFile,
@@ -96,7 +97,10 @@ export function buildScanContext(input: AnalyzeInput): ScanContext {
     try {
       const doc: any = yaml.load(f.content) ?? {};
       used.push(c);
-      for (const [k, v] of Object.entries(doc)) if (v !== null && typeof v !== 'object' && String(v).trim() !== '') config[k] = String(v).trim();
+      for (const [k, v] of Object.entries(doc)) {
+        if (Array.isArray(v) && v.every((x) => typeof x === 'string')) config[k] = v.join(', ');
+        else if (v !== null && typeof v !== 'object' && String(v).trim() !== '') config[k] = String(v).trim();
+      }
       config._file = used.join(', ');
     } catch {
       alerts.push({ level: 'warning', message: `No se pudo leer ${c}` });
@@ -334,7 +338,46 @@ export function buildDashboard(ctx: ScanContext, style?: CommandStyle): Dashboar
     config: ctx.config,
     details,
     specContext: toSpecContext(ctx),
+    planningDocs: findPlanningDocs(ctx.files, ctx.config),
   };
+}
+
+/**
+ * Documentos de planificación que el asistente puede usar como contexto.
+ * Si un documento está fragmentado (p. ej. docs/architecture/*.md, de shard-doc), se usan los fragmentos.
+ */
+export function findPlanningDocs(files: VFile[], config: Record<string, string>): PlanningDoc[] {
+  const kindOf = (p: string): PlanningDoc['kind'] | null => {
+    const name = P.basename(p).toLowerCase();
+    const dirs = p.toLowerCase().split('/').slice(0, -1);
+    if (/^project[-_]context\.md$/.test(name)) return 'context';
+    if (STORY_FILE_RE.test(P.basename(p)) || /sprint-status|retro|tech-spec|readiness|checklist/.test(name)) return null;
+    if (name === 'index.md' && dirs.some((d) => ['prd', 'architecture', 'epics'].includes(d) || /^ux([-_].*)?$/.test(d))) return null; // índice de shard-doc
+    if (dirs.includes('prd')) return 'prd';
+    if (dirs.includes('architecture')) return 'architecture';
+    if (dirs.some((d) => /^ux([-_].*)?$/.test(d))) return 'ux';
+    if (/^prd(\.md|[-_].*\.md)$/.test(name)) return 'prd';
+    if (/^architecture.*\.md$/.test(name)) return 'architecture';
+    if (/^(ux[-_].*|.*ux[-_]?(design|spec).*)\.md$/.test(name)) return 'ux';
+    if (/^(product[-_]?brief).*\.md$/.test(name)) return 'brief';
+    if (/^epics?\.md$/.test(name) || dirs.includes('epics')) return 'epics';
+    return null;
+  };
+  const always = new Set(
+    (config.devLoadAlwaysFiles ?? config.dev_load_always_files ?? '')
+      .split(',')
+      .map((x) => x.trim().replace(/^\.\//, ''))
+      .filter(Boolean),
+  );
+  const out: PlanningDoc[] = [];
+  for (const f of files) {
+    if (!/\.md$/i.test(f.path) || CONFIG_FILES.includes(f.path)) continue;
+    const kind = always.has(f.path) ? 'always' : kindOf(f.path);
+    if (kind) out.push({ path: f.path, kind, mtime: f.mtime, size: f.size, shard: kind !== 'always' && kind !== 'context' && P.basename(f.path).toLowerCase() !== `${kind}.md` && f.path.toLowerCase().split('/').slice(0, -1).includes(kind) });
+  }
+  // Si hay fragmentos de un tipo, se omite el documento completo de ese tipo (evita duplicados)
+  const sharded = new Set(out.filter((d) => d.shard).map((d) => d.kind));
+  return out.filter((d) => d.shard || !sharded.has(d.kind)).sort((a, b) => a.path.localeCompare(b.path));
 }
 
 export function nextStoryNumber(ctx: { parsedStories: ParsedStory[]; sprint?: SprintStatusData; plannedEpics: PlannedEpic[] }, epic: number): number {
